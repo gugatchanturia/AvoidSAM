@@ -4,6 +4,7 @@ from entities.aircraft import Aircraft
 from entities.sam_truck import SAMTruck
 from entities.missile import Missile
 
+
 @dataclass
 class GameState:
     grid: Grid
@@ -12,3 +13,4 @@ class GameState:
     missiles: list[Missile] = field(default_factory=list)
     tick: int = 0
     intercepted: bool = False
+    failed: bool = False
