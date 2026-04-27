@@ -2,6 +2,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+
 @dataclass
 class Vector2D:
     x: float
@@ -9,6 +10,9 @@ class Vector2D:
 
     def __add__(self, other: Vector2D) -> Vector2D:
         return Vector2D(self.x + other.x, self.y + other.y)
+
+    def __sub__(self, other: Vector2D) -> Vector2D:
+        return Vector2D(self.x - other.x, self.y - other.y)
 
     def __mul__(self, scalar: float) -> Vector2D:
         return Vector2D(self.x * scalar, self.y * scalar)
@@ -27,3 +31,6 @@ class Vector2D:
         if mag == 0:
             return Vector2D(0.0, 0.0)
         return Vector2D(self.x / mag, self.y / mag)
+
+    def distance_to(self, other: Vector2D) -> float:
+        return (self - other).length()

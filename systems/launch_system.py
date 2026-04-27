@@ -1,11 +1,14 @@
+from __future__ import annotations
+import math
 from dataclasses import dataclass
 
-from core.directions import Direction
+from core.directions import DirectionVector, DIRECTIONS, nearest_direction
 from core.vector import Vector2D
 from core.grid import Grid
 from entities.sam_truck import SAMTruck
 from entities.aircraft import Aircraft
 from entities.missile import Missile
+from systems.collision_system import HIT_RADIUS
 
 
 # ---------------------------------------------------------------------------
@@ -14,18 +17,18 @@ from entities.missile import Missile
 
 @dataclass(frozen=True)
 class TruckPlan:
-    plan_type: str          # "fire_now" | "wait_then_fire" | "move_then_fire" | "move_then_wait_then_fire"
-    move_direction: Direction | None
-    move_steps: int         # ticks truck moves before stopping
-    wait_steps: int         # ticks truck waits after moving, before firing
-    fire_direction: Direction
-    missile_steps: int      # ticks from launch until intercept
-    fire_tick: int          # move_steps + wait_steps  (ticks from NOW until launch)
-    intercept_tick: int     # fire_tick + missile_steps
+    plan_type:      str
+    move_direction: DirectionVector | None
+    move_steps:     int
+    wait_steps:     int
+    fire_direction: DirectionVector
+    missile_steps:  int
+    fire_tick:      int
+    intercept_tick: int
 
 
 # ---------------------------------------------------------------------------
-# Internal simulation helpers
+# Simulation helpers
 # ---------------------------------------------------------------------------
 
 def _copy_pos(pos: Vector2D) -> Vector2D:
@@ -33,25 +36,26 @@ def _copy_pos(pos: Vector2D) -> Vector2D:
 
 
 def _simulate_positions(
-    start: Vector2D,
-    direction: Direction,
-    speed: float,
-    dt: float,
-    grid: Grid,
+    start:     Vector2D,
+    direction: DirectionVector,
+    speed:     float,
+    dt:        float,
+    grid:      Grid,
     max_steps: int,
     is_missile: bool,
 ) -> list[Vector2D]:
     """
-    Returns a list of positions of length up to max_steps + 1.
-    Index 0 = starting position (before any movement).
-    Index k = position after k ticks of movement.
-    Missile: stops appending once it would leave bounds.
-    Aircraft/truck: clamps to last valid position and continues.
+    Returns positions list; index 0 = start (before movement).
+    Missile  : stops if it would leave bounds.
+    Aircraft/Truck : clamps to last valid pos and continues.
     """
-    pos = _copy_pos(start)
+    pos       = _copy_pos(start)
     positions = [_copy_pos(pos)]
     for _ in range(max_steps):
-        new_pos = pos + direction.value * (speed * dt)
+        new_pos = Vector2D(
+            pos.x + direction.x * speed * dt,
+            pos.y + direction.y * speed * dt,
+        )
         if not grid.in_bounds(new_pos):
             if is_missile:
                 break
@@ -62,83 +66,90 @@ def _simulate_positions(
     return positions
 
 
-def _simulate_tiles(
-    start: Vector2D,
-    direction: Direction,
-    speed: float,
-    dt: float,
-    grid: Grid,
-    max_steps: int,
-    is_missile: bool,
-) -> list[tuple[int, int]]:
-    return [
-        grid.to_tile(p)
-        for p in _simulate_positions(start, direction, speed, dt, grid, max_steps, is_missile)
-    ]
-
-
-def _best_missile_intercept(
-    fire_pos: Vector2D,
-    aircraft_tiles: list[tuple[int, int]],
-    fire_tick: int,
-    missile_speed: float,
-    dt: float,
-    grid: Grid,
-    max_future_steps: int,
-) -> tuple[Direction, int] | None:
+def _intercept_step(
+    fire_pos:       Vector2D,
+    aircraft_positions: list[Vector2D],
+    fire_tick:      int,
+    missile_dir:    DirectionVector,
+    missile_speed:  float,
+    dt:             float,
+    grid:           Grid,
+    max_steps:      int,
+) -> int | None:
     """
-    Try all 8 missile directions from fire_pos.
-
-    aircraft_tiles[i] = aircraft tile at tick i relative to NOW (index 0 = current).
-    fire_tick         = ticks from NOW until launch.
-    missile_steps k   = missile has moved k ticks after launch.
-    Interception when missile_tiles[k] == aircraft_tiles[fire_tick + k].
-
-    Returns (best_direction, missile_steps) or None.
+    Simulate missile from fire_pos in missile_dir.
+    Return the missile step k (>=1) at which distance to aircraft <= HIT_RADIUS,
+    comparing missile_positions[k] vs aircraft_positions[fire_tick + k].
+    Returns None if no intercept within max_steps.
     """
-    best_direction = None
-    best_missile_steps = max_future_steps + 1
-
-    for candidate in Direction:
-        missile_tiles = _simulate_tiles(
-            fire_pos, candidate, missile_speed,
-            dt, grid, max_future_steps, is_missile=True,
+    missile_pos = _copy_pos(fire_pos)
+    for k in range(1, max_steps + 1):
+        new_missile = Vector2D(
+            missile_pos.x + missile_dir.x * missile_speed * dt,
+            missile_pos.y + missile_dir.y * missile_speed * dt,
         )
-        # missile_tiles[0] is the launch tile (no movement yet)
-        # missile_tiles[k] is after k ticks of missile movement
-        for k in range(1, len(missile_tiles)):
-            ac_index = fire_tick + k
-            if ac_index >= len(aircraft_tiles):
-                break
-            if missile_tiles[k] == aircraft_tiles[ac_index]:
-                if k < best_missile_steps:
-                    best_missile_steps = k
-                    best_direction = candidate
-                break
+        if not grid.in_bounds(new_missile):
+            return None
+        missile_pos = new_missile
 
-    if best_direction is None:
+        ac_index = fire_tick + k
+        if ac_index >= len(aircraft_positions):
+            return None
+
+        dist = missile_pos.distance_to(aircraft_positions[ac_index])
+        if dist <= HIT_RADIUS:
+            return k
+
+    return None
+
+
+def _best_missile_for_position(
+    fire_pos:           Vector2D,
+    aircraft_positions: list[Vector2D],
+    fire_tick:          int,
+    missile_speed:      float,
+    dt:                 float,
+    grid:               Grid,
+    remaining_horizon:  int,
+) -> tuple[DirectionVector, int] | None:
+    best_dir   = None
+    best_steps = remaining_horizon + 1
+
+    for candidate in DIRECTIONS:
+        k = _intercept_step(
+            fire_pos, aircraft_positions, fire_tick,
+            candidate, missile_speed, dt, grid, remaining_horizon,
+        )
+        if k is not None and k < best_steps:
+            best_steps = k
+            best_dir   = candidate
+
+    if best_dir is None:
         return None
-    return (best_direction, best_missile_steps)
+    return (best_dir, best_steps)
 
 
 # ---------------------------------------------------------------------------
-# Per-category plan finders
+# Per-category finders
 # ---------------------------------------------------------------------------
+
+def _plan_key(p: TruckPlan, current_dir: DirectionVector) -> tuple:
+    direction_penalty = (
+        0 if (p.move_direction is None or p.move_direction is current_dir) else 1
+    )
+    return (p.intercept_tick + direction_penalty, p.fire_tick, p.move_steps, direction_penalty)
+
 
 def _find_fire_now(
     truck_pos: Vector2D,
-    aircraft_tiles: list[tuple[int, int]],
+    aircraft_positions: list[Vector2D],
     missile_speed: float,
     dt: float,
     grid: Grid,
     horizon: int,
 ) -> TruckPlan | None:
-    result = _best_missile_intercept(
-        truck_pos, aircraft_tiles,
-        fire_tick=0,
-        missile_speed=missile_speed,
-        dt=dt, grid=grid,
-        max_future_steps=horizon,
+    result = _best_missile_for_position(
+        truck_pos, aircraft_positions, 0, missile_speed, dt, grid, horizon,
     )
     if result is None:
         return None
@@ -157,24 +168,19 @@ def _find_fire_now(
 
 def _find_wait_then_fire(
     truck_pos: Vector2D,
-    aircraft_tiles: list[tuple[int, int]],
+    aircraft_positions: list[Vector2D],
     missile_speed: float,
     dt: float,
     grid: Grid,
     horizon: int,
 ) -> TruckPlan | None:
-    best_plan: TruckPlan | None = None
-
+    best = None
     for wait_steps in range(1, horizon):
         remaining = horizon - wait_steps
-        if remaining <= 0:
+        if remaining <= 0 or wait_steps >= len(aircraft_positions):
             break
-        result = _best_missile_intercept(
-            truck_pos, aircraft_tiles,
-            fire_tick=wait_steps,
-            missile_speed=missile_speed,
-            dt=dt, grid=grid,
-            max_future_steps=remaining,
+        result = _best_missile_for_position(
+            truck_pos, aircraft_positions, wait_steps, missile_speed, dt, grid, remaining,
         )
         if result is None:
             continue
@@ -189,49 +195,37 @@ def _find_wait_then_fire(
             fire_tick=wait_steps,
             intercept_tick=wait_steps + missile_steps,
         )
-        if best_plan is None or _plan_key(candidate) < _plan_key(best_plan):
-            best_plan = candidate
-
-    return best_plan
+        if best is None or (candidate.intercept_tick, candidate.fire_tick) < (best.intercept_tick, best.fire_tick):
+            best = candidate
+    return best
 
 
 def _find_move_then_fire(
     truck_pos: Vector2D,
     truck_speed: float,
-    aircraft_tiles: list[tuple[int, int]],
+    aircraft_positions: list[Vector2D],
     missile_speed: float,
     dt: float,
     grid: Grid,
     horizon: int,
 ) -> TruckPlan | None:
-    best_plan: TruckPlan | None = None
-
-    for move_dir in Direction:
+    best = None
+    for move_dir in DIRECTIONS:
         truck_positions = _simulate_positions(
-            truck_pos, move_dir, truck_speed,
-            dt, grid, horizon, is_missile=False,
+            truck_pos, move_dir, truck_speed, dt, grid, horizon, is_missile=False,
         )
-        max_move_steps = len(truck_positions) - 1
-
-        for move_steps in range(1, max_move_steps + 1):
+        max_move = min(len(truck_positions) - 1, 12)
+        for move_steps in range(1, max_move + 1):
             fire_tick = move_steps
             remaining = horizon - fire_tick
-            if remaining <= 0:
+            if remaining <= 0 or fire_tick >= len(aircraft_positions):
                 break
-            if fire_tick >= len(aircraft_tiles):
-                break
-
-            staging_pos = truck_positions[move_steps]
-            result = _best_missile_intercept(
-                staging_pos, aircraft_tiles,
-                fire_tick=fire_tick,
-                missile_speed=missile_speed,
-                dt=dt, grid=grid,
-                max_future_steps=remaining,
+            result = _best_missile_for_position(
+                truck_positions[move_steps], aircraft_positions,
+                fire_tick, missile_speed, dt, grid, remaining,
             )
             if result is None:
                 continue
-
             fire_dir, missile_steps = result
             candidate = TruckPlan(
                 plan_type="move_then_fire",
@@ -243,51 +237,40 @@ def _find_move_then_fire(
                 fire_tick=fire_tick,
                 intercept_tick=fire_tick + missile_steps,
             )
-            if best_plan is None or _plan_key(candidate) < _plan_key(best_plan):
-                best_plan = candidate
-
-    return best_plan
+            if best is None or (candidate.intercept_tick, candidate.fire_tick, candidate.move_steps) < \
+                               (best.intercept_tick,   best.fire_tick,   best.move_steps):
+                best = candidate
+    return best
 
 
 def _find_move_then_wait_then_fire(
     truck_pos: Vector2D,
     truck_speed: float,
-    aircraft_tiles: list[tuple[int, int]],
+    aircraft_positions: list[Vector2D],
     missile_speed: float,
     dt: float,
     grid: Grid,
     horizon: int,
 ) -> TruckPlan | None:
-    best_plan: TruckPlan | None = None
-
-    for move_dir in Direction:
+    best = None
+    for move_dir in DIRECTIONS:
         truck_positions = _simulate_positions(
-            truck_pos, move_dir, truck_speed,
-            dt, grid, horizon, is_missile=False,
+            truck_pos, move_dir, truck_speed, dt, grid, horizon, is_missile=False,
         )
-        max_move_steps = len(truck_positions) - 1
-
-        for move_steps in range(1, max_move_steps + 1):
-            staging_pos = truck_positions[move_steps]
-
-            for wait_steps in range(1, horizon - move_steps + 1):
+        max_move = min(len(truck_positions) - 1, 12)
+        for move_steps in range(1, max_move + 1):
+            max_wait = min(horizon - move_steps, 12)
+            for wait_steps in range(1, max_wait + 1):
                 fire_tick = move_steps + wait_steps
                 remaining = horizon - fire_tick
-                if remaining <= 0:
+                if remaining <= 0 or fire_tick >= len(aircraft_positions):
                     break
-                if fire_tick >= len(aircraft_tiles):
-                    break
-
-                result = _best_missile_intercept(
-                    staging_pos, aircraft_tiles,
-                    fire_tick=fire_tick,
-                    missile_speed=missile_speed,
-                    dt=dt, grid=grid,
-                    max_future_steps=remaining,
+                result = _best_missile_for_position(
+                    truck_positions[move_steps], aircraft_positions,
+                    fire_tick, missile_speed, dt, grid, remaining,
                 )
                 if result is None:
                     continue
-
                 fire_dir, missile_steps = result
                 candidate = TruckPlan(
                     plan_type="move_then_wait_then_fire",
@@ -299,121 +282,74 @@ def _find_move_then_wait_then_fire(
                     fire_tick=fire_tick,
                     intercept_tick=fire_tick + missile_steps,
                 )
-                if best_plan is None or _plan_key(candidate) < _plan_key(best_plan):
-                    best_plan = candidate
-
-    return best_plan
+                if best is None or (candidate.intercept_tick, candidate.fire_tick, candidate.move_steps) < \
+                                   (best.intercept_tick,   best.fire_tick,   best.move_steps):
+                    best = candidate
+    return best
 
 
 # ---------------------------------------------------------------------------
-# Plan sorting key and top-level planner
+# Top-level planner
 # ---------------------------------------------------------------------------
-
-def _plan_key(p: TruckPlan) -> tuple:
-    return (p.intercept_tick, p.fire_tick, p.move_steps)
-
 
 def find_best_truck_plan(
-    truck: SAMTruck,
-    aircraft: Aircraft,
-    truck_speed: float,
-    missile_speed: float,
-    dt: float,
-    grid: Grid,
+    truck:          SAMTruck,
+    aircraft_pos:   Vector2D,
+    aircraft_dir:   DirectionVector | None,
+    aircraft_speed: float | None,
+    truck_speed:    float,
+    missile_speed:  float,
+    dt:             float,
+    grid:           Grid,
     max_future_steps: int = 40,
 ) -> tuple[
-    TruckPlan | None,   # fire_now
-    TruckPlan | None,   # wait_then_fire
-    TruckPlan | None,   # move_then_fire
-    TruckPlan | None,   # move_then_wait_then_fire
-    TruckPlan | None,   # best overall
+    TruckPlan | None,
+    TruckPlan | None,
+    TruckPlan | None,
+    TruckPlan | None,
+    TruckPlan | None,
 ]:
-    aircraft_tiles = _simulate_tiles(
-        aircraft.position, aircraft.direction, aircraft.speed,
+    # No radar lock yet → cannot plan
+    if aircraft_dir is None or aircraft_speed is None:
+        return None, None, None, None, None
+
+    # Build a temporary aircraft-like object for simulation
+    class _FakeAircraft:
+        position  = aircraft_pos
+        direction = aircraft_dir
+        speed     = aircraft_speed
+
+    fake_ac = _FakeAircraft()
+
+    aircraft_positions = _simulate_positions(
+        aircraft_pos, aircraft_dir, aircraft_speed,
         dt, grid, max_future_steps, is_missile=False,
     )
 
-    fire_now   = _find_fire_now(truck.position, aircraft_tiles, missile_speed, dt, grid, max_future_steps)
-    wait_plan  = _find_wait_then_fire(truck.position, aircraft_tiles, missile_speed, dt, grid, max_future_steps)
-    move_plan  = _find_move_then_fire(truck.position, truck_speed, aircraft_tiles, missile_speed, dt, grid, max_future_steps)
-    mwf_plan   = _find_move_then_wait_then_fire(truck.position, truck_speed, aircraft_tiles, missile_speed, dt, grid, max_future_steps)
+    fire_now  = _find_fire_now(truck.position, aircraft_positions, missile_speed, dt, grid, max_future_steps)
+    wait_plan = _find_wait_then_fire(truck.position, aircraft_positions, missile_speed, dt, grid, max_future_steps)
+    move_plan = _find_move_then_fire(truck.position, truck_speed, aircraft_positions, missile_speed, dt, grid, max_future_steps)
+    mwf_plan  = _find_move_then_wait_then_fire(truck.position, truck_speed, aircraft_positions, missile_speed, dt, grid, max_future_steps)
 
     candidates = [p for p in (fire_now, wait_plan, move_plan, mwf_plan) if p is not None]
-    best = min(candidates, key=_plan_key) if candidates else None
+    best = (
+        min(candidates, key=lambda p: _plan_key(p, truck.direction))
+        if candidates else None
+    )
 
     return fire_now, wait_plan, move_plan, mwf_plan, best
 
 
-# ---------------------------------------------------------------------------
-# Launch helpers
-# ---------------------------------------------------------------------------
-
-def find_launch_solution(
-    truck: SAMTruck,
-    aircraft: Aircraft,
-    missile_speed: float,
-    dt: float,
-    grid: Grid,
-    max_future_steps: int = 30,
-) -> tuple[Direction, int] | None:
-    aircraft_tiles = _simulate_tiles(
-        aircraft.position, aircraft.direction, aircraft.speed,
-        dt, grid, max_future_steps, is_missile=False,
-    )
-    return _best_missile_intercept(
-        truck.position, aircraft_tiles,
-        fire_tick=0,
-        missile_speed=missile_speed,
-        dt=dt, grid=grid,
-        max_future_steps=max_future_steps,
-    )
-
-
-def find_launch_direction(
-    truck: SAMTruck,
-    aircraft: Aircraft,
-    missile_speed: float,
-    dt: float,
-    grid: Grid,
-    max_future_steps: int = 30,
-) -> Direction | None:
-    result = find_launch_solution(truck, aircraft, missile_speed, dt, grid, max_future_steps)
-    return result[0] if result is not None else None
-
-
 def launch_missile_in_direction(
-    truck: SAMTruck,
+    truck:         SAMTruck,
     missile_speed: float,
-    direction: Direction,
+    direction:     DirectionVector,
 ) -> Missile | None:
     if truck.has_fired:
         return None
     truck.has_fired = True
     return Missile(
         position=Vector2D(truck.position.x, truck.position.y),
-        speed=missile_speed,
-        direction=direction,
-        active=True,
-    )
-
-
-def launch_missile(
-    truck: SAMTruck,
-    aircraft: Aircraft,
-    missile_speed: float,
-    dt: float,
-    grid: Grid,
-    max_future_steps: int = 30,
-) -> Missile | None:
-    if truck.has_fired:
-        return None
-    result = find_launch_solution(truck, aircraft, missile_speed, dt, grid, max_future_steps)
-    if result is None:
-        return None
-    direction, _ = result
-    truck.has_fired = True
-    return Missile(
-        position=_copy_pos(truck.position),
         speed=missile_speed,
         direction=direction,
         active=True,

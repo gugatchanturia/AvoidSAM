@@ -1,6 +1,9 @@
+from __future__ import annotations
+import math
+
 from core.grid import Grid
 from core.vector import Vector2D
-from core.directions import Direction
+from core.directions import DirectionVector, DIRECTIONS, nearest_direction
 from entities.aircraft import Aircraft
 from entities.sam_truck import SAMTruck
 from game.state import GameState
@@ -14,58 +17,36 @@ from systems.launch_system import (
 )
 from systems.collision_system import check_interception
 
-# How many ticks the aircraft must be stationary-at-border with no plan
-# before we declare the scenario a dead end.
-_STALL_LIMIT = 12
+_STALL_LIMIT = 16
 
 
 def _fmt_plan(label: str, plan: TruckPlan | None) -> str:
     if plan is None:
         return f"  {label:<26s}: no solution"
+    md = f"({plan.move_direction.x:.2f},{plan.move_direction.y:.2f})" if plan.move_direction else "NONE"
+    fd = f"({plan.fire_direction.x:.2f},{plan.fire_direction.y:.2f})"
     return (
         f"  {label:<26s}: "
-        f"move={plan.move_direction.name if plan.move_direction else 'NONE'} x{plan.move_steps}  "
+        f"move={md} x{plan.move_steps}  "
         f"wait={plan.wait_steps}  "
-        f"fire_dir={plan.fire_direction.name:<2s}  "
+        f"fire_dir={fd}  "
         f"fire_tick={plan.fire_tick:<3d}  "
         f"intercept_tick={plan.intercept_tick}"
     )
 
 
-def _plan_sort_key(plan: TruckPlan, current_dir: Direction) -> tuple:
-    """
-    Primary priority  : earliest intercept_tick
-    Secondary         : earlier fire_tick
-    Tertiary          : fewer move_steps
-    Stability penalty : penalise direction change with a weight of 0.5 ticks.
-                        A new direction is only chosen when it beats the current
-                        direction by MORE than 0.5 effective ticks on the primary
-                        criterion — implemented by adding 1 to intercept_tick when
-                        the first-move direction differs from the truck's current
-                        direction.  This is strong enough to suppress jitter but
-                        never overrides a genuine 1-tick improvement.
-    """
-    direction_penalty = (
-        0
-        if (plan.move_direction is None or plan.move_direction == current_dir)
-        else 1
-    )
-    return (
-        plan.intercept_tick + direction_penalty,
-        plan.fire_tick,
-        plan.move_steps,
-        direction_penalty,
-    )
-
-
 class App:
     def __init__(self):
-        self.scenarios: list[Scenario] = SCENARIOS
-        self.scenario_index: int = 0
-        self.last_action: str = ""
-        self.last_plan_type: str = ""
-        # stall detection
-        self._stall_ticks: int = 0
+        self.scenarios:       list[Scenario] = SCENARIOS
+        self.scenario_index:  int            = 0
+        self.last_action:     str            = ""
+        self.last_plan_type:  str            = ""
+        self._stall_ticks:    int            = 0
+
+        # Radar-inferred values (updated each tick, exposed for display)
+        self.inferred_direction: DirectionVector | None = None
+        self.inferred_speed:     float | None           = None
+
         self.state: GameState = self._build_state(self.scenarios[0])
 
     # ------------------------------------------------------------------
@@ -74,26 +55,35 @@ class App:
 
     def _build_state(self, scenario: Scenario) -> GameState:
         grid = Grid(width=C.GRID_WIDTH, height=C.GRID_HEIGHT)
+
+        ac_dir = nearest_direction(
+            math.cos(scenario.aircraft_dir_angle),
+            math.sin(scenario.aircraft_dir_angle),
+        )
         aircraft = Aircraft(
             position=Vector2D(scenario.aircraft_pos.x, scenario.aircraft_pos.y),
             speed=C.AIRCRAFT_SPEED,
-            direction=scenario.aircraft_dir,
+            direction=ac_dir,
         )
+
+        truck_dir = DIRECTIONS[0]
         sam_truck = SAMTruck(
             position=Vector2D(scenario.truck_pos.x, scenario.truck_pos.y),
             speed=C.TRUCK_SPEED,
-            direction=scenario.truck_dir,
+            direction=truck_dir,
         )
         return GameState(grid=grid, aircraft=aircraft, sam_truck=sam_truck)
 
     def load_scenario(self, index: int) -> None:
-        self.scenario_index = index % len(self.scenarios)
-        self.state = self._build_state(self.scenarios[self.scenario_index])
-        self.last_action = ""
-        self.last_plan_type = ""
-        self._stall_ticks = 0
+        self.scenario_index  = index % len(self.scenarios)
+        self.state           = self._build_state(self.scenarios[self.scenario_index])
+        self.last_action     = ""
+        self.last_plan_type  = ""
+        self._stall_ticks    = 0
+        self.inferred_direction = None
+        self.inferred_speed     = None
         print(f"\n{'='*60}")
-        print(f"  Scenario {self.scenario_index + 1}/{len(self.scenarios)}: "
+        print(f"  Scenario {self.scenario_index+1}/{len(self.scenarios)}: "
               f"{self.scenarios[self.scenario_index].name}")
         print(f"{'='*60}")
 
@@ -109,6 +99,26 @@ class App:
         return self.scenarios[self.scenario_index]
 
     # ------------------------------------------------------------------
+    # Radar inference
+    # ------------------------------------------------------------------
+
+    def _update_radar(self) -> None:
+        s   = self.state
+        pos = Vector2D(s.aircraft.position.x, s.aircraft.position.y)
+        s.aircraft_history.append(pos)
+
+        if len(s.aircraft_history) >= 2:
+            p0    = s.aircraft_history[-2]
+            p1    = s.aircraft_history[-1]
+            delta = p1 - p0
+            spd   = delta.length() / C.DT
+            if spd > 1e-6:
+                norm                    = delta.normalized()
+                self.inferred_direction = nearest_direction(norm.x, norm.y)
+                self.inferred_speed     = spd
+            # if aircraft is stationary keep previous estimate
+
+    # ------------------------------------------------------------------
     # Planner
     # ------------------------------------------------------------------
 
@@ -116,20 +126,16 @@ class App:
         s     = self.state
         truck = s.sam_truck
 
-        fire_now, wait_plan, move_plan, mwf_plan, _ = find_best_truck_plan(
+        fire_now, wait_plan, move_plan, mwf_plan, best = find_best_truck_plan(
             truck=truck,
-            aircraft=s.aircraft,
+            aircraft_pos=Vector2D(s.aircraft.position.x, s.aircraft.position.y),
+            aircraft_dir=self.inferred_direction,
+            aircraft_speed=self.inferred_speed,
             truck_speed=C.TRUCK_SPEED,
             missile_speed=C.MISSILE_SPEED,
             dt=C.DT,
             grid=s.grid,
             max_future_steps=C.PLANNING_HORIZON,
-        )
-
-        candidates = [p for p in (fire_now, wait_plan, move_plan, mwf_plan) if p is not None]
-        best = (
-            min(candidates, key=lambda p: _plan_sort_key(p, truck.direction))
-            if candidates else None
         )
 
         print("  --- Planner ---")
@@ -139,13 +145,11 @@ class App:
         print(_fmt_plan("move_then_wait_then_fire", mwf_plan))
 
         if best is None:
-            print("  selected                  : NONE")
+            print("  selected: NONE")
             self.last_plan_type = "none"
         else:
-            print(
-                f"  selected                  : [{best.plan_type}]  "
-                f"fire_tick={best.fire_tick}  intercept_tick={best.intercept_tick}"
-            )
+            print(f"  selected: [{best.plan_type}]  "
+                  f"fire_tick={best.fire_tick}  intercept_tick={best.intercept_tick}")
             self.last_plan_type = best.plan_type
 
         return best
@@ -155,19 +159,13 @@ class App:
     # ------------------------------------------------------------------
 
     def _update_stall(self, had_plan: bool) -> None:
-        """
-        Increment the stall counter when the aircraft is at the grid border
-        AND the planner found no solution.  Reset it otherwise.
-        """
-        s  = self.state
-        ac = s.aircraft
-        tx, ty = s.grid.to_tile(ac.position)
+        s    = self.state
+        pos  = s.aircraft.position
         at_border = (
-            tx <= 0 or ty <= 0 or
-            tx >= s.grid.width  - 1 or
-            ty >= s.grid.height - 1
+            pos.x <= 0.05 or pos.y <= 0.05 or
+            pos.x >= s.grid.width  - 0.05 or
+            pos.y >= s.grid.height - 0.05
         )
-
         if at_border and not had_plan:
             self._stall_ticks += 1
         else:
@@ -175,7 +173,7 @@ class App:
 
         if self._stall_ticks >= _STALL_LIMIT:
             s.failed = True
-            print(f"  *** SCENARIO FAILED — aircraft border-stall, no solution ***")
+            print("  *** SCENARIO FAILED — border stall, no solution ***")
 
     # ------------------------------------------------------------------
     # Single tick
@@ -187,56 +185,65 @@ class App:
 
         s.tick += 1
 
+        # 1. Update radar (observe current aircraft position)
+        self._update_radar()
+
+        # 2. Truck decision (only if radar has at least 2 observations)
         best: TruckPlan | None = None
 
         if not truck.has_fired:
-            best = self._replan()
+            if self.inferred_direction is not None:
+                best = self._replan()
 
-            if best is not None:
-                if best.move_steps > 0:
-                    truck.direction = best.move_direction
-                    move_entity(truck, C.DT, s.grid)
-                    self.last_action = f"move {best.move_direction.name}"
-                    print(
-                        f"  ACTION: move {best.move_direction.name}  "
-                        f"(plan needs {best.move_steps} move steps total)"
-                    )
-                elif best.wait_steps > 0:
-                    self.last_action = "wait"
-                    print(f"  ACTION: wait  (plan needs {best.wait_steps} wait steps total)")
+                if best is not None:
+                    if best.move_steps > 0:
+                        truck.direction = best.move_direction
+                        move_entity(truck, C.DT, s.grid, state=s)
+                        self.last_action = f"move ({best.move_direction.x:.2f},{best.move_direction.y:.2f})"
+                        print(f"  ACTION: move  (plan needs {best.move_steps} steps total)")
+                    elif best.wait_steps > 0:
+                        self.last_action = "wait"
+                        print(f"  ACTION: wait  (plan needs {best.wait_steps} wait steps total)")
+                    else:
+                        missile = launch_missile_in_direction(truck, C.MISSILE_SPEED, best.fire_direction)
+                        if missile is not None:
+                            s.missiles.append(missile)
+                            self.last_action = f"FIRED ({best.fire_direction.x:.2f},{best.fire_direction.y:.2f})"
+                            print(f"  ACTION: >>> FIRED  tick={s.tick}")
                 else:
-                    missile = launch_missile_in_direction(
-                        truck, C.MISSILE_SPEED, best.fire_direction,
-                    )
-                    if missile is not None:
-                        s.missiles.append(missile)
-                        self.last_action = f"FIRED {best.fire_direction.name}"
-                        print(f"  ACTION: >>> FIRED  dir={best.fire_direction.name}  tick={s.tick}")
+                    self.last_action = "idle"
+                    print("  ACTION: idle (no plan found)")
             else:
-                self.last_action = "idle"
-                print("  ACTION: idle (no plan found)")
+                self.last_action = "waiting for radar lock"
+                print("  ACTION: waiting for radar lock (tick 1)")
 
-        move_entity(s.aircraft, C.DT, s.grid)
+        # 3. Move aircraft
+        move_entity(s.aircraft, C.DT, s.grid, state=s)
+
+        # 4. Move missiles
         for missile in s.missiles:
-            move_entity(missile, C.DT, s.grid)
+            move_entity(missile, C.DT, s.grid, state=s)
 
+        # 5. Collision
         if check_interception(s.aircraft, s.missiles, s.grid):
             s.intercepted = True
 
+        # 6. Stall detection
         self._update_stall(had_plan=(best is not None))
 
-        ac_tile    = s.aircraft.tile(s.grid)
-        truck_tile = truck.tile(s.grid)
-        print(f"[Tick {s.tick:>3}]")
-        print(f"  Aircraft : pos={s.aircraft.position}  tile={ac_tile}")
-        print(f"  Truck    : pos={truck.position}  tile={truck_tile}  fired={truck.has_fired}")
+        # 7. Console debug
+        print(f"[Tick {s.tick:>3}]  "
+              f"AC={s.aircraft.position}  "
+              f"inferred_dir={'({:.2f},{:.2f})'.format(self.inferred_direction.x, self.inferred_direction.y) if self.inferred_direction else 'UNKNOWN'}  "
+              f"inferred_spd={'{:.2f}'.format(self.inferred_speed) if self.inferred_speed else 'UNKNOWN'}  "
+              f"truck={truck.position}  fired={truck.has_fired}")
         for i, m in enumerate(s.missiles):
-            print(f"  M{i}       : pos={m.position}  tile={m.tile(s.grid)}  active={m.active}")
+            print(f"  M{i}: pos={m.position}  active={m.active}")
         if s.intercepted:
             print(f"\n*** INTERCEPTED at tick {s.tick}! ***\n")
 
     # ------------------------------------------------------------------
-    # Console-only runner
+    # Console runner
     # ------------------------------------------------------------------
 
     def run(self) -> None:

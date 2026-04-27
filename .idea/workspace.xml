@@ -2,17 +2,26 @@
 <project version="4">
   <component name="ChangeListManager">
     <list default="true" id="26c96aaa-5260-48e6-acd3-c46de89ad4ae" name="Changes" comment="Initial working simulation: movement, prediction, interception, basic AI">
-      <change afterPath="$PROJECT_DIR$/game/scenarios.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/.gitignore" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/AvoidSAM.iml" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/modules.xml" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/core/directions.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/directions.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/core/grid.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/grid.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/core/vector.py" beforeDir="false" afterPath="$PROJECT_DIR$/core/vector.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/entities/aircraft.py" beforeDir="false" afterPath="$PROJECT_DIR$/entities/aircraft.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/entities/base.py" beforeDir="false" afterPath="$PROJECT_DIR$/entities/base.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/entities/missile.py" beforeDir="false" afterPath="$PROJECT_DIR$/entities/missile.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/entities/sam_truck.py" beforeDir="false" afterPath="$PROJECT_DIR$/entities/sam_truck.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/game/app.py" beforeDir="false" afterPath="$PROJECT_DIR$/game/app.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/game/constants.py" beforeDir="false" afterPath="$PROJECT_DIR$/game/constants.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/game/scenarios.py" beforeDir="false" afterPath="$PROJECT_DIR$/game/scenarios.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/game/state.py" beforeDir="false" afterPath="$PROJECT_DIR$/game/state.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/systems/collision_system.py" beforeDir="false" afterPath="$PROJECT_DIR$/systems/collision_system.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/systems/launch_system.py" beforeDir="false" afterPath="$PROJECT_DIR$/systems/launch_system.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/systems/movement_system.py" beforeDir="false" afterPath="$PROJECT_DIR$/systems/movement_system.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -84,7 +93,7 @@
       <updated>1776256401079</updated>
       <workItem from="1776256402085" duration="8211000" />
       <workItem from="1776325540838" duration="2238000" />
-      <workItem from="1776337416030" duration="11809000" />
+      <workItem from="1776337416030" duration="24192000" />
     </task>
     <task id="LOCAL-00001" summary="Initial working simulation: movement, prediction, interception, basic AI">
       <option name="closed" value="true" />
@@ -118,6 +127,6 @@
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/AvoidSAM$app.coverage" NAME="app Coverage Results" MODIFIED="1776319279130" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/game" />
     <SUITE FILE_PATH="coverage/AvoidSAM$constants.coverage" NAME="constants Coverage Results" MODIFIED="1776841308856" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/game" />
-    <SUITE FILE_PATH="coverage/AvoidSAM$main.coverage" NAME="main Coverage Results" MODIFIED="1776846231717" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/AvoidSAM$main.coverage" NAME="main Coverage Results" MODIFIED="1777251613861" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
   </component>
 </project>
