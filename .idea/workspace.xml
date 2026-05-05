@@ -1,13 +1,20 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="26c96aaa-5260-48e6-acd3-c46de89ad4ae" name="Changes" comment="Upgrade planner and simulation: add 32-direction system, implement radar-based velocity inference (2-tick), replace tile collision with hit-radius, enforce new boundary rules, cap planning search space (move/wait limits, reduced horizon), and update rendering with directional shapes and improved grid">
-      <change afterPath="$PROJECT_DIR$/.idea/AvoidSAM.iml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/systems/target_predictor.py" afterDir="false" />
+    <list default="true" id="26c96aaa-5260-48e6-acd3-c46de89ad4ae" name="Changes" comment="Implement analytic intercept planner with plan persistence and predictor abstraction&#10;&#10;- Replaced brute-force missile search with analytic quadratic intercept solve&#10;- Added radius-aware interception logic (HIT_RADIUS integrated correctly)&#10;- Introduced snap + neighbour verification with safe full fallback&#10;- Implemented plan persistence to avoid per-tick replanning&#10;- Added TargetPredictor abstraction (ConstantVelocityPredictor)&#10;- Prepared architecture for future single-turn player evasion&#10;- Reduced planner runtime from hundreds of ms per tick to near-zero after first plan&#10;- Improved diagnostics and planner performance visibility&#10;&#10;Result: Major performance improvement and stable interception behavior across scenarios">
+      <change afterPath="$PROJECT_DIR$/docs/CURSOR_INSTRUCTIONS.md" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/docs/PROJECT_CONTEXT.md" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/docs/WORKFLOW.md" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/game/pva_rules.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/entities/missile.py" beforeDir="false" afterPath="$PROJECT_DIR$/entities/missile.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/game/app.py" beforeDir="false" afterPath="$PROJECT_DIR$/game/app.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/game/constants.py" beforeDir="false" afterPath="$PROJECT_DIR$/game/constants.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/game/state.py" beforeDir="false" afterPath="$PROJECT_DIR$/game/state.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/systems/launch_system.py" beforeDir="false" afterPath="$PROJECT_DIR$/systems/launch_system.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/systems/movement_system.py" beforeDir="false" afterPath="$PROJECT_DIR$/systems/movement_system.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/systems/target_predictor.py" beforeDir="false" afterPath="$PROJECT_DIR$/systems/target_predictor.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -45,26 +52,31 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "ModuleVcsDetector.initialDetectionPerformed": "true",
-    "Python.app.executor": "Run",
-    "Python.constants.executor": "Run",
-    "Python.launch_system.executor": "Run",
-    "Python.main.executor": "Run",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
-    "RunOnceActivity.git.unshallow": "true",
-    "RunOnceActivity.typescript.service.memoryLimit.init": "true",
-    "SHARE_PROJECT_CONFIGURATION_FILES": "true",
-    "codeWithMe.voiceChat.enabledByDefault": "false",
-    "git-widget-placeholder": "master",
-    "last_opened_file_path": "/home/gugatchanturia/PycharmProjects/AvoidSAM/.venv/bin/python",
-    "nodejs_package_manager_path": "npm",
-    "settings.editor.selected.configurable": "com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable",
-    "vue.rearranger.settings.migration": "true"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
+    &quot;Python.app.executor&quot;: &quot;Run&quot;,
+    &quot;Python.constants.executor&quot;: &quot;Run&quot;,
+    &quot;Python.launch_system.executor&quot;: &quot;Run&quot;,
+    &quot;Python.main.executor&quot;: &quot;Run&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.typescript.service.memoryLimit.init&quot;: &quot;true&quot;,
+    &quot;SHARE_PROJECT_CONFIGURATION_FILES&quot;: &quot;true&quot;,
+    &quot;codeWithMe.voiceChat.enabledByDefault&quot;: &quot;false&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;master&quot;,
+    &quot;last_opened_file_path&quot;: &quot;/home/gugatchanturia/PycharmProjects/AvoidSAM/.venv/bin/python&quot;,
+    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable&quot;,
+    &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
   }
-}]]></component>
+}</component>
+  <component name="RecentsManager">
+    <key name="MoveFile.RECENT_KEYS">
+      <recent name="$PROJECT_DIR$/docs" />
+    </key>
+  </component>
   <component name="SharedIndexes">
     <attachedChunks>
       <set>
@@ -82,7 +94,8 @@
       <workItem from="1776256402085" duration="8211000" />
       <workItem from="1776325540838" duration="2238000" />
       <workItem from="1776337416030" duration="24396000" />
-      <workItem from="1777451710042" duration="7184000" />
+      <workItem from="1777451710042" duration="23775000" />
+      <workItem from="1777840467083" duration="1025000" />
     </task>
     <task id="LOCAL-00001" summary="Initial working simulation: movement, prediction, interception, basic AI">
       <option name="closed" value="true" />
@@ -92,7 +105,15 @@
       <option name="project" value="LOCAL" />
       <updated>1776323449797</updated>
     </task>
-    <option name="localTasksCounter" value="2" />
+    <task id="LOCAL-00002" summary="Implement analytic intercept planner with plan persistence and predictor abstraction&#10;&#10;- Replaced brute-force missile search with analytic quadratic intercept solve&#10;- Added radius-aware interception logic (HIT_RADIUS integrated correctly)&#10;- Introduced snap + neighbour verification with safe full fallback&#10;- Implemented plan persistence to avoid per-tick replanning&#10;- Added TargetPredictor abstraction (ConstantVelocityPredictor)&#10;- Prepared architecture for future single-turn player evasion&#10;- Reduced planner runtime from hundreds of ms per tick to near-zero after first plan&#10;- Improved diagnostics and planner performance visibility&#10;&#10;Result: Major performance improvement and stable interception behavior across scenarios">
+      <option name="closed" value="true" />
+      <created>1777658848013</created>
+      <option name="number" value="00002" />
+      <option name="presentableId" value="LOCAL-00002" />
+      <option name="project" value="LOCAL" />
+      <updated>1777658848013</updated>
+    </task>
+    <option name="localTasksCounter" value="3" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -111,12 +132,13 @@
   </component>
   <component name="VcsManagerConfiguration">
     <MESSAGE value="Initial working simulation: movement, prediction, interception, basic AI" />
-    <option name="LAST_COMMIT_MESSAGE" value="Initial working simulation: movement, prediction, interception, basic AI" />
+    <MESSAGE value="Implement analytic intercept planner with plan persistence and predictor abstraction&#10;&#10;- Replaced brute-force missile search with analytic quadratic intercept solve&#10;- Added radius-aware interception logic (HIT_RADIUS integrated correctly)&#10;- Introduced snap + neighbour verification with safe full fallback&#10;- Implemented plan persistence to avoid per-tick replanning&#10;- Added TargetPredictor abstraction (ConstantVelocityPredictor)&#10;- Prepared architecture for future single-turn player evasion&#10;- Reduced planner runtime from hundreds of ms per tick to near-zero after first plan&#10;- Improved diagnostics and planner performance visibility&#10;&#10;Result: Major performance improvement and stable interception behavior across scenarios" />
+    <option name="LAST_COMMIT_MESSAGE" value="Implement analytic intercept planner with plan persistence and predictor abstraction&#10;&#10;- Replaced brute-force missile search with analytic quadratic intercept solve&#10;- Added radius-aware interception logic (HIT_RADIUS integrated correctly)&#10;- Introduced snap + neighbour verification with safe full fallback&#10;- Implemented plan persistence to avoid per-tick replanning&#10;- Added TargetPredictor abstraction (ConstantVelocityPredictor)&#10;- Prepared architecture for future single-turn player evasion&#10;- Reduced planner runtime from hundreds of ms per tick to near-zero after first plan&#10;- Improved diagnostics and planner performance visibility&#10;&#10;Result: Major performance improvement and stable interception behavior across scenarios" />
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/AvoidSAM$launch_system.coverage" NAME="launch_system Coverage Results" MODIFIED="1777455451423" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/systems" />
     <SUITE FILE_PATH="coverage/AvoidSAM$app.coverage" NAME="app Coverage Results" MODIFIED="1776319279130" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/game" />
     <SUITE FILE_PATH="coverage/AvoidSAM$constants.coverage" NAME="constants Coverage Results" MODIFIED="1776841308856" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/game" />
-    <SUITE FILE_PATH="coverage/AvoidSAM$main.coverage" NAME="main Coverage Results" MODIFIED="1777658316119" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/AvoidSAM$main.coverage" NAME="main Coverage Results" MODIFIED="1777836514452" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
   </component>
 </project>

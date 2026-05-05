@@ -3,6 +3,7 @@ from core.vector import Vector2D
 from entities.base import BaseEntity
 from entities.missile import Missile
 from entities.aircraft import Aircraft
+from game import constants as C
 
 
 def move_entity(entity: BaseEntity, dt: float, grid: Grid, state=None) -> None:
@@ -22,6 +23,11 @@ def move_entity(entity: BaseEntity, dt: float, grid: Grid, state=None) -> None:
 
     if grid.in_bounds(new_pos):
         entity.position = new_pos
+        if isinstance(entity, Missile):
+            missile = entity
+            missile.steps_alive += 1
+            if missile.steps_alive >= C.MISSILE_MAX_STEPS:
+                missile.active = False
     else:
         if isinstance(entity, Missile):
             entity.active = False
