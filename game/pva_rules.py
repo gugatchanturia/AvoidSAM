@@ -37,6 +37,28 @@ def is_border_tile(grid: Grid, tile: Tile) -> bool:
 def tile_pos(tile: Tile) -> Vector2D:
     return Vector2D(float(tile[0]), float(tile[1]))
 
+def first_exit_tick_straight(
+    grid: Grid,
+    position: Vector2D,
+    direction: DirectionVector,
+    speed: float,
+    dt: float,
+    max_ticks: int,
+) -> int | None:
+    """
+    Simulate straight (no-turn) motion and return the first tick index (1-based)
+    where the next step would leave the grid, or None if it stays in-bounds for
+    the full checked window.
+    """
+    pos = Vector2D(position.x, position.y)
+    steps = max(0, int(max_ticks))
+    for tick in range(1, steps + 1):
+        nxt = Vector2D(pos.x + direction.x * speed * dt, pos.y + direction.y * speed * dt)
+        if not grid.in_bounds(nxt):
+            return tick
+        pos = nxt
+    return None
+
 
 def _angle_diff(a: float, b: float) -> float:
     d = (a - b + math.pi) % (2 * math.pi) - math.pi
@@ -238,10 +260,15 @@ def project_valid_exit_tiles(
     turn_window_min: int | None = None,
     turn_window_max: int | None = None,
 ) -> set[Tile]:
-    del speed, dt, turn_window_min, turn_window_max
+    spd = float(C.AIRCRAFT_SPEED) if speed is None else float(speed)
+    step_dt = float(C.DT) if dt is None else float(dt)
+    tw_max = int(C.TURN_WINDOW_MAX) if turn_window_max is None else int(turn_window_max)
     stripe = exit_stripe_half_for_pva()
     start = tile_pos(tile)
-    out = first_boundary_exit_tiles(grid, start, direction, stripe_half=stripe)
+    exits_early = first_exit_tick_straight(grid, start, direction, spd, step_dt, tw_max)
+    out = set()
+    if exits_early is None or exits_early > tw_max:
+        out = first_boundary_exit_tiles(grid, start, direction, stripe_half=stripe)
     ESCAPE_DEBUG_LAST["stripe_half"] = stripe
     ESCAPE_DEBUG_LAST["locked_exit_count"] = len(out)
     ESCAPE_DEBUG_LAST["first_hit_debug"] = first_boundary_hit_coord_for_debug(grid, start, direction)
@@ -322,8 +349,15 @@ def legal_launch_directions(
     ESCAPE_DEBUG_LAST["pva_launch_half_cone_deg"] = half_deg_used
     ESCAPE_DEBUG_LAST["pva_launch_base_rad"] = base_angle
     ESCAPE_DEBUG_LAST["pva_launch_cone_expand_extra_deg"] = max(0.0, half_deg_used - base_half_deg)
-    ESCAPE_DEBUG_LAST["pva_launch_count"] = len(picked)
-    return picked
+    tw_max = int(C.TURN_WINDOW_MAX)
+    kept: list[DirectionVector] = []
+    for d in picked:
+        exit_tick = first_exit_tick_straight(grid, start, d, speed, dt, tw_max)
+        if exit_tick is not None and exit_tick <= tw_max:
+            continue
+        kept.append(d)
+    ESCAPE_DEBUG_LAST["pva_launch_count"] = len(kept)
+    return kept
 
 
 def legal_turn_directions(
