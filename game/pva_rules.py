@@ -542,6 +542,30 @@ def crossed_exit_tile(prev_pos: Vector2D, next_pos: Vector2D, grid: Grid) -> Til
     return (max(0, min(grid.width - 1, idx)), grid.height - 1)
 
 
+def exit_allowed_interval_for_edge(
+    grid: Grid,
+    valid_exit_tiles: frozenset[Tile],
+    edge: str,
+    tolerance_tiles: float,
+) -> tuple[float, float] | None:
+    if not valid_exit_tiles:
+        return None
+    tol = max(0.0, float(tolerance_tiles))
+    if edge in ("top", "bottom"):
+        y = 0 if edge == "top" else (grid.height - 1)
+        idxs = sorted({x for (x, yy) in valid_exit_tiles if yy == y})
+    elif edge in ("left", "right"):
+        x = 0 if edge == "left" else (grid.width - 1)
+        idxs = sorted({y for (xx, y) in valid_exit_tiles if xx == x})
+    else:
+        return None
+    if not idxs:
+        return None
+    low = float(min(idxs)) - 0.5 - tol
+    high = float(max(idxs)) + 0.5 + tol
+    return (low, high)
+
+
 def exit_crossing_allowed(
     prev_pos: Vector2D,
     next_pos: Vector2D,
@@ -563,7 +587,7 @@ def exit_crossing_allowed(
             y = prev_pos.y + t_left * dy
             if -_EPS <= y <= grid.height - 1 + _EPS:
                 candidates.append((t_left, "left", y))
-        t_right = ((grid.width - 1) - prev_pos.x) / dx
+        t_right = (float(grid.width) - prev_pos.x) / dx
         if _EPS < t_right <= 1.0 + _EPS:
             y = prev_pos.y + t_right * dy
             if -_EPS <= y <= grid.height - 1 + _EPS:
@@ -575,7 +599,7 @@ def exit_crossing_allowed(
             x = prev_pos.x + t_top * dx
             if -_EPS <= x <= grid.width - 1 + _EPS:
                 candidates.append((t_top, "top", x))
-        t_bottom = ((grid.height - 1) - prev_pos.y) / dy
+        t_bottom = (float(grid.height) - prev_pos.y) / dy
         if _EPS < t_bottom <= 1.0 + _EPS:
             x = prev_pos.x + t_bottom * dx
             if -_EPS <= x <= grid.width - 1 + _EPS:
@@ -605,19 +629,9 @@ def exit_crossing_allowed(
     _, edge, coord = min(candidates, key=lambda item: item[0])
     rounded = crossed_exit_tile(prev_pos, next_pos, grid)
 
-    if edge == "top":
-        valid_idx = sorted({x for (x, y) in valid_exit_tiles if y == 0})
-    elif edge == "bottom":
-        valid_idx = sorted({x for (x, y) in valid_exit_tiles if y == grid.height - 1})
-    elif edge == "left":
-        valid_idx = sorted({y for (x, y) in valid_exit_tiles if x == 0})
-    else:  # right
-        valid_idx = sorted({y for (x, y) in valid_exit_tiles if x == grid.width - 1})
-
-    if not valid_idx:
+    interval = exit_allowed_interval_for_edge(grid, valid_exit_tiles, edge, tolerance_tiles)
+    if interval is None:
         return (False, rounded, edge, float(coord))
-
-    tol = max(0.0, float(tolerance_tiles))
-    half = 0.5 + tol
-    allowed = any((i - half) <= coord <= (i + half) for i in valid_idx)
+    low, high = interval
+    allowed = (low - 1e-12) <= float(coord) <= (high + 1e-12)
     return (bool(allowed), rounded, edge, float(coord))

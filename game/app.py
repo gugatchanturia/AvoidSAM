@@ -18,6 +18,7 @@ from game.pva_rules import (
     all_border_tiles,
     crossed_exit_tile,
     exit_crossing_allowed,
+    exit_allowed_interval_for_edge,
     exit_stripe_half_for_pva,
     explain_legal_turn_empty,
     is_border_tile,
@@ -111,6 +112,9 @@ class App:
         self.pva_turn_used: bool = False
         self.pva_turn_hover_direction: DirectionVector | None = None
         self.pva_result_text: str = ""
+        self.pva_post_fire_pressure_steps: int = 0
+        self.pva_exit_debug_point: Vector2D | None = None
+        self.pva_exit_debug_allowed: bool | None = None
 
         # Visual-only: persistent movement trail segments (cleared per run)
         self.movement_trails: list[TrailSegment] = []
@@ -263,6 +267,9 @@ class App:
         self.pva_turn_used = False
         self.pva_turn_hover_direction = None
         self.pva_result_text = ""
+        self.pva_post_fire_pressure_steps = 0
+        self.pva_exit_debug_point = None
+        self.pva_exit_debug_allowed = None
         self.movement_trails = []
 
     # ------------------------------------------------------------------
@@ -284,6 +291,9 @@ class App:
         self.last_diag = PlannerDiagnostic()
         self._predictor = ConstantVelocityPredictor()
         self.movement_trails = []
+        self.pva_post_fire_pressure_steps = 0
+        self.pva_exit_debug_point = None
+        self.pva_exit_debug_allowed = None
         print(f"\n{'='*64}")
         print(
             f"  Scenario {self.scenario_index + 1}/{len(self.scenarios)}: "
@@ -573,21 +583,18 @@ class App:
 
         ac_pos = Vector2D(s.aircraft.position.x, s.aircraft.position.y)
         truck_pos = Vector2D(s.sam_truck.position.x, s.sam_truck.position.y)
-        cur_dist = truck_pos.distance_to(ac_pos)
         jam_r = float(C.JAMMER_RADIUS)
+        cp = self._pva_control_point()
 
-        def rank_candidate(candidate: TruckPlan | None) -> tuple[int, float, int, int] | None:
+        def rank_candidate(candidate: TruckPlan | None) -> tuple[float, float, int, int] | None:
             if candidate is None:
-                return None
-
-            if candidate.move_steps <= 0:
                 return None
 
             if best.primary_hit and not candidate.primary_hit:
                 return None
-            if int(candidate.intercept_tick) > int(best.intercept_tick) + 2:
+            if int(candidate.intercept_tick) > int(best.intercept_tick) + 3:
                 return None
-            if int(candidate.fire_tick) > int(best.fire_tick) + 2:
+            if int(candidate.fire_tick) > int(best.fire_tick) + 3:
                 return None
 
             ok = validate_plan(
@@ -606,24 +613,42 @@ class App:
             if not ok:
                 return None
 
-            est_pos = self._estimate_truck_pos_after_move_steps(candidate)
-            dist_at_fire = est_pos.distance_to(ac_pos)
-            improvement = cur_dist - dist_at_fire
-            near = 1 if dist_at_fire <= jam_r + 0.5 + 1e-9 else 0
-
-            if improvement < 0.10 and near == 0:
+            if cp is None:
                 return None
 
-            # Tie-break (higher is better first): near-jammer, then closer distance, then earlier intercept/fire.
-            return (near, dist_at_fire, int(candidate.intercept_tick), int(candidate.fire_tick))
+            est_pos = self._estimate_truck_pos_after_move_steps(candidate)
+            dist_to_cp = est_pos.distance_to(cp)
+            improvement_cp = truck_pos.distance_to(cp) - dist_to_cp
+            near = 1 if dist_to_cp <= jam_r + 1.0 + 1e-9 else 0
 
-        best_rank: tuple[int, float, int, int] | None = None
+            staged = 1 if (candidate.move_steps > 0 or candidate.wait_steps > 0) else 0
+            if staged == 0 and improvement_cp <= 0.02 and near == 0:
+                return None
+
+            score = 0.0
+            if dist_to_cp <= jam_r + 1e-9:
+                score += 120.0
+            elif dist_to_cp <= jam_r + 1.0 + 1e-9:
+                score += 55.0
+
+            score += max(0.0, improvement_cp) * 30.0
+            score += 12.0 * float(staged) + 3.0 * float(max(0, int(candidate.move_steps)))
+
+            score -= 2.2 * float(int(candidate.fire_tick))
+            score -= 1.4 * float(int(candidate.intercept_tick))
+
+            # Higher score is better; then closer distance; then earlier intercept/fire.
+            return (score, dist_to_cp, int(candidate.intercept_tick), int(candidate.fire_tick))
+
+        best_rank: tuple[float, float, int, int] | None = None
         best_candidate: TruckPlan | None = None
-        for cand in (move_plan, mwf_plan):
+        for cand in (fire_now, wait_plan, move_plan, mwf_plan):
             ranked = rank_candidate(cand)
             if ranked is None:
                 continue
-            if best_rank is None or (ranked[0] > best_rank[0]) or (ranked[0] == best_rank[0] and ranked[1:] < best_rank[1:]):
+            if best_rank is None or (ranked[0] > best_rank[0]) or (
+                abs(ranked[0] - best_rank[0]) <= 1e-9 and ranked[1:] < best_rank[1:]
+            ):
                 best_rank = ranked
                 best_candidate = cand
 
@@ -632,16 +657,122 @@ class App:
         if best_candidate is best:
             return best
 
+        cand_score = float(best_rank[0])
+        if cand_score <= 0.0:
+            return best
+
+        current_best_rank = rank_candidate(best)
+        current_best_score = float(current_best_rank[0]) if current_best_rank is not None else None
+        if current_best_score is not None:
+            if cand_score <= current_best_score + 1.0:
+                return best
+        else:
+            if cand_score <= 8.0:
+                return best
+
+        score = best_rank[0]
         dist_new = best_rank[1]
         fire_delta = int(best_candidate.fire_tick) - int(best.fire_tick)
         int_delta = int(best_candidate.intercept_tick) - int(best.intercept_tick)
         print(
-            "[pva-pressure] override "
+            "[pva-exit-control] override "
             f"{best.plan_type} -> {best_candidate.plan_type} "
-            f"dist {cur_dist:.2f} -> {dist_new:.2f} "
-            f"fire {fire_delta:+d} intercept {int_delta:+d}"
+            f"ambush_gain={score:.1f} fire {fire_delta:+d} intercept {int_delta:+d}"
         )
         return best_candidate
+
+    def _pva_exit_center(self) -> Vector2D | None:
+        if self.mode != self.MODE_PVA:
+            return None
+        if not self.pva_locked_exit_tiles:
+            return None
+        xs = [t[0] + 0.5 for t in self.pva_locked_exit_tiles]
+        ys = [t[1] + 0.5 for t in self.pva_locked_exit_tiles]
+        return Vector2D(sum(xs) / float(len(xs)), sum(ys) / float(len(ys)))
+
+    def _pva_control_point(self) -> Vector2D | None:
+        """Fixed exit-ambush point inside the board (does not depend on aircraft position)."""
+        if self.mode != self.MODE_PVA or self.pva_phase != self.PVA_RUNNING:
+            return None
+        if not self.pva_locked_exit_tiles:
+            return None
+        s = self.state
+
+        exit_center = self._pva_exit_center()
+        if exit_center is None:
+            return None
+
+        w, h = s.grid.width, s.grid.height
+        edge: str | None = None
+        if any(y == 0 for (_, y) in self.pva_locked_exit_tiles):
+            edge = "top"
+        elif any(y == h - 1 for (_, y) in self.pva_locked_exit_tiles):
+            edge = "bottom"
+        elif any(x == 0 for (x, _) in self.pva_locked_exit_tiles):
+            edge = "left"
+        elif any(x == w - 1 for (x, _) in self.pva_locked_exit_tiles):
+            edge = "right"
+
+        inward = min(float(C.JAMMER_RADIUS) * 0.75, 3.0)
+        if edge == "top":
+            cp = Vector2D(exit_center.x, 0.0 + inward)
+        elif edge == "bottom":
+            cp = Vector2D(exit_center.x, float(h - 1) - inward)
+        elif edge == "left":
+            cp = Vector2D(0.0 + inward, exit_center.y)
+        elif edge == "right":
+            cp = Vector2D(float(w - 1) - inward, exit_center.y)
+        else:
+            cp = exit_center
+
+        return cp if s.grid.in_bounds(cp) else exit_center if s.grid.in_bounds(exit_center) else None
+
+    def _pva_control_staging_action(self) -> bool:
+        s = self.state
+        truck = s.sam_truck
+        if self.mode != self.MODE_PVA or self.pva_phase != self.PVA_RUNNING:
+            return False
+        if truck.has_fired or self.pva_turn_used:
+            return False
+        if self.inferred_direction is None:
+            return False
+
+        cp = self._pva_control_point()
+        if cp is None:
+            return False
+
+        cur_cp = truck.position.distance_to(cp)
+        if cur_cp <= 0.35:
+            return False
+
+        best_d: DirectionVector | None = None
+        best_cp = cur_cp
+        for d in DIRECTIONS:
+            nxt = Vector2D(
+                truck.position.x + d.x * truck.speed * C.DT,
+                truck.position.y + d.y * truck.speed * C.DT,
+            )
+            if not s.grid.in_bounds(nxt):
+                continue
+            dcp = nxt.distance_to(cp)
+            if dcp < best_cp - 1e-12:
+                best_cp = dcp
+                best_d = d
+
+        if best_d is None:
+            return False
+
+        cp_gain = cur_cp - best_cp
+        if cp_gain < 0.05:
+            return False
+
+        start = Vector2D(truck.position.x, truck.position.y)
+        truck.direction = best_d
+        move_entity(truck, C.DT, s.grid, state=s)
+        self._record_entity_move("sam", start, truck, s.tick)
+        self.last_action = "control staging"
+        print(f"  ACTION: exit-control staging move  d={self._direction_name(best_d)}")
+        return True
 
     def _replan(self) -> TruckPlan | None:
         s = self.state
@@ -771,6 +902,60 @@ class App:
         print(f"  ACTION: jammer pressure move  d={self._direction_name(best_d)}")
         return True
 
+    def _post_fire_jammer_pressure_action(self) -> bool:
+        s = self.state
+        truck = s.sam_truck
+
+        if self.mode != self.MODE_PVA or self.pva_phase != self.PVA_RUNNING:
+            return False
+        if not truck.has_fired:
+            return False
+        if self.pva_turn_used:
+            return False
+        if not self.jammer_active():
+            return False
+        if self.pva_post_fire_pressure_steps >= 2:
+            return False
+
+        dist = self.jammer_distance_tiles()
+        if dist is None:
+            return False
+        if dist <= float(C.JAMMER_RADIUS) + 1e-9:
+            self.last_action = "post-fire jammer support (hold)"
+            return True
+
+        target = Vector2D(s.aircraft.position.x, s.aircraft.position.y)
+        cur_dist = truck.position.distance_to(target)
+
+        best_d: DirectionVector | None = None
+        best_dist = cur_dist
+        for d in DIRECTIONS:
+            nxt = Vector2D(
+                truck.position.x + d.x * truck.speed * C.DT,
+                truck.position.y + d.y * truck.speed * C.DT,
+            )
+            if not s.grid.in_bounds(nxt):
+                continue
+            dd = nxt.distance_to(target)
+            if dd < best_dist - 1e-12:
+                best_dist = dd
+                best_d = d
+
+        if best_d is None:
+            return False
+
+        if (cur_dist - best_dist) < 0.05:
+            return False
+
+        start = Vector2D(truck.position.x, truck.position.y)
+        truck.direction = best_d
+        move_entity(truck, C.DT, s.grid, state=s)
+        self._record_entity_move("sam", start, truck, s.tick)
+        self.pva_post_fire_pressure_steps += 1
+        self.last_action = "post-fire jammer support"
+        print(f"  ACTION: post-fire jammer support move  d={self._direction_name(best_d)}")
+        return True
+
     def _apply_truck_action(self) -> TruckPlan | None:
         s = self.state
         truck = s.sam_truck
@@ -779,6 +964,8 @@ class App:
         self._refresh_predictor()
 
         if truck.has_fired:
+            if self._post_fire_jammer_pressure_action():
+                return None
             return None
 
         if self.inferred_direction is None:
@@ -798,6 +985,16 @@ class App:
 
         best = self.active_plan
         if best is None:
+            if (
+                self.mode == self.MODE_PVA
+                and self.pva_phase == self.PVA_RUNNING
+                and not truck.has_fired
+                and not self.pva_turn_used
+                and self.has_aircraft
+                and not self.scenario_finished()
+            ):
+                if self._pva_control_staging_action():
+                    return None
             self.last_action = "idle (no plan)"
             print("  ACTION: idle (no plan)")
             return None
@@ -1105,6 +1302,17 @@ class App:
             frozenset(self.pva_locked_exit_tiles),
             float(C.PVA_EXIT_TOLERANCE_TILES),
         )
+        self.pva_exit_debug_allowed = bool(allowed)
+        if edge == "top" and coord is not None:
+            self.pva_exit_debug_point = Vector2D(float(coord), 0.0)
+        elif edge == "bottom" and coord is not None:
+            self.pva_exit_debug_point = Vector2D(float(coord), float(s.grid.height))
+        elif edge == "left" and coord is not None:
+            self.pva_exit_debug_point = Vector2D(0.0, float(coord))
+        elif edge == "right" and coord is not None:
+            self.pva_exit_debug_point = Vector2D(float(s.grid.width), float(coord))
+        else:
+            self.pva_exit_debug_point = None
         if allowed:
             s.escaped = True
             self.pva_phase = self.PVA_END
@@ -1130,11 +1338,17 @@ class App:
                 valid_on_edge = sorted([t for t in self.pva_locked_exit_tiles if t[0] == 0])
             elif edge == "right":
                 valid_on_edge = sorted([t for t in self.pva_locked_exit_tiles if t[0] == s.grid.width - 1])
+            interval = (
+                exit_allowed_interval_for_edge(s.grid, frozenset(self.pva_locked_exit_tiles), edge, float(C.PVA_EXIT_TOLERANCE_TILES))
+                if edge is not None
+                else None
+            )
+            interval_s = f"[{interval[0]:.2f},{interval[1]:.2f}]" if interval is not None else "None"
             print(
                 "[pva-exit-fail] "
                 f"edge={edge} coord={coord} rounded={exit_tile} "
                 f"rounded_allowed={exit_tile in self.pva_locked_exit_tiles if exit_tile is not None else False} "
-                f"valid={valid_on_edge} tol={float(C.PVA_EXIT_TOLERANCE_TILES):.2f}"
+                f"allowed_interval={interval_s} valid={valid_on_edge} tol={float(C.PVA_EXIT_TOLERANCE_TILES):.2f}"
             )
             s.failed = True
             self.pva_phase = self.PVA_END

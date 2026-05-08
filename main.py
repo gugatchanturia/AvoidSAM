@@ -246,6 +246,26 @@ def draw_jammer_radius(screen, truck_pos: Vector2D, radius_tiles: float) -> None
     pygame.draw.circle(overlay, (*COL_JAMMER, 120), (int(cx), int(cy)), rpx, 2)
     screen.blit(overlay, (0, 0))
 
+def draw_pva_exit_marker(screen, app) -> None:
+    if app.mode != App.MODE_PVA:
+        return
+    if app.pva_phase != App.PVA_END:
+        return
+    p = getattr(app, "pva_exit_debug_point", None)
+    if p is None:
+        return
+    allowed = getattr(app, "pva_exit_debug_allowed", None)
+    col = (80, 220, 120) if allowed else (220, 70, 70)
+    x = int(round(p.x * CELL_SIZE))
+    y = int(round(p.y * CELL_SIZE))
+    grid_w_px = int(app.state.grid.width * CELL_SIZE)
+    grid_h_px = int(app.state.grid.height * CELL_SIZE)
+    x = max(0, min(x, grid_w_px))
+    y = max(0, min(y, grid_h_px))
+    pygame.draw.circle(screen, col, (x, y), 6, 2)
+    pygame.draw.line(screen, col, (x - 7, y), (x + 7, y), 2)
+    pygame.draw.line(screen, col, (x, y - 7), (x, y + 7), 2)
+
 
 def draw_menu(screen, font, font_small, screen_w, screen_h, buttons: list[Button]) -> None:
     title = font.render("AvoidSAM", True, COL_TEXT)
@@ -591,6 +611,7 @@ def main() -> None:
             if app.mode == App.MODE_PVA:
                 draw_jammer_radius(screen, truck.position, float(C.JAMMER_RADIUS))
             draw_movement_trails(screen, app.movement_trails)
+            draw_pva_exit_marker(screen, app)
             draw_truck(screen, truck.position, truck.direction)
 
             if app.mode == App.MODE_AUTOMATIC:
