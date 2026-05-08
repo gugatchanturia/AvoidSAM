@@ -17,6 +17,7 @@ from game.pva_rules import (
     ESCAPE_DEBUG_LAST,
     all_border_tiles,
     crossed_exit_tile,
+    exit_crossing_allowed,
     exit_stripe_half_for_pva,
     explain_legal_turn_empty,
     is_border_tile,
@@ -546,6 +547,102 @@ class App:
         )
         return best_candidate
 
+    def _select_pva_pressure_aware_plan(
+        self,
+        *,
+        fire_now: TruckPlan | None,
+        wait_plan: TruckPlan | None,
+        move_plan: TruckPlan | None,
+        mwf_plan: TruckPlan | None,
+        best: TruckPlan,
+    ) -> TruckPlan:
+        if self.mode != self.MODE_PVA:
+            return best
+        if self.pva_phase != self.PVA_RUNNING:
+            return best
+        if self.pva_turn_used:
+            return best
+        if not self.jammer_active():
+            return best
+        if not self.has_aircraft:
+            return best
+
+        s = self.state
+        if self.inferred_direction is None or self.inferred_speed is None:
+            return best
+
+        ac_pos = Vector2D(s.aircraft.position.x, s.aircraft.position.y)
+        truck_pos = Vector2D(s.sam_truck.position.x, s.sam_truck.position.y)
+        cur_dist = truck_pos.distance_to(ac_pos)
+        jam_r = float(C.JAMMER_RADIUS)
+
+        def rank_candidate(candidate: TruckPlan | None) -> tuple[int, float, int, int] | None:
+            if candidate is None:
+                return None
+
+            if candidate.move_steps <= 0:
+                return None
+
+            if best.primary_hit and not candidate.primary_hit:
+                return None
+            if int(candidate.intercept_tick) > int(best.intercept_tick) + 2:
+                return None
+            if int(candidate.fire_tick) > int(best.fire_tick) + 2:
+                return None
+
+            ok = validate_plan(
+                candidate,
+                s.sam_truck,
+                ac_pos,
+                self.inferred_direction,
+                float(self.inferred_speed),
+                C.MISSILE_SPEED,
+                C.DT,
+                s.grid,
+                C.PLANNING_HORIZON,
+                self._predictor,
+                missile_verify_cap=C.MISSILE_MAX_STEPS,
+            )
+            if not ok:
+                return None
+
+            est_pos = self._estimate_truck_pos_after_move_steps(candidate)
+            dist_at_fire = est_pos.distance_to(ac_pos)
+            improvement = cur_dist - dist_at_fire
+            near = 1 if dist_at_fire <= jam_r + 0.5 + 1e-9 else 0
+
+            if improvement < 0.10 and near == 0:
+                return None
+
+            # Tie-break (higher is better first): near-jammer, then closer distance, then earlier intercept/fire.
+            return (near, dist_at_fire, int(candidate.intercept_tick), int(candidate.fire_tick))
+
+        best_rank: tuple[int, float, int, int] | None = None
+        best_candidate: TruckPlan | None = None
+        for cand in (move_plan, mwf_plan):
+            ranked = rank_candidate(cand)
+            if ranked is None:
+                continue
+            if best_rank is None or (ranked[0] > best_rank[0]) or (ranked[0] == best_rank[0] and ranked[1:] < best_rank[1:]):
+                best_rank = ranked
+                best_candidate = cand
+
+        if best_candidate is None or best_rank is None:
+            return best
+        if best_candidate is best:
+            return best
+
+        dist_new = best_rank[1]
+        fire_delta = int(best_candidate.fire_tick) - int(best.fire_tick)
+        int_delta = int(best_candidate.intercept_tick) - int(best.intercept_tick)
+        print(
+            "[pva-pressure] override "
+            f"{best.plan_type} -> {best_candidate.plan_type} "
+            f"dist {cur_dist:.2f} -> {dist_new:.2f} "
+            f"fire {fire_delta:+d} intercept {int_delta:+d}"
+        )
+        return best_candidate
+
     def _replan(self) -> TruckPlan | None:
         s = self.state
         truck = s.sam_truck
@@ -565,13 +662,34 @@ class App:
             prefer_truck_staging=(self.mode == self.MODE_PVA),
         )
         if best is not None:
-            best = self._select_pva_jammer_aware_plan(
+            best = self._select_pva_pressure_aware_plan(
                 fire_now=fire_now,
                 wait_plan=wait_plan,
                 move_plan=move_plan,
                 mwf_plan=mwf_plan,
                 best=best,
             )
+            if self.mode == self.MODE_PVA and self.pva_phase == self.PVA_RUNNING:
+                if self.inferred_direction is None or self.inferred_speed is None:
+                    print(f"[pva-plan-reject] final validation failed type={best.plan_type} (no radar lock)")
+                    best = None
+                else:
+                    ok = validate_plan(
+                        best,
+                        truck,
+                        Vector2D(s.aircraft.position.x, s.aircraft.position.y),
+                        self.inferred_direction,
+                        float(self.inferred_speed),
+                        C.MISSILE_SPEED,
+                        C.DT,
+                        s.grid,
+                        C.PLANNING_HORIZON,
+                        self._predictor,
+                        missile_verify_cap=C.MISSILE_MAX_STEPS,
+                    )
+                    if not ok:
+                        print(f"[pva-plan-reject] final validation failed type={best.plan_type}")
+                        best = None
         self.last_planner_ms = (time.perf_counter() - t0) * 1000.0
         self.last_diag = diag
         self._ticks_since_replan = 0
@@ -680,16 +798,6 @@ class App:
 
         best = self.active_plan
         if best is None:
-            if (
-                self.mode == self.MODE_PVA
-                and self.pva_phase == self.PVA_RUNNING
-                and not self.pva_turn_used
-                and self.has_aircraft
-                and not self.scenario_finished()
-            ):
-                did = self._jammer_pressure_action()
-                if did:
-                    return None
             self.last_action = "idle (no plan)"
             print("  ACTION: idle (no plan)")
             return None
@@ -988,13 +1096,46 @@ class App:
             self._append_trail_segment("aircraft", start, Vector2D(next_pos.x, next_pos.y), s.tick)
             return
         self._append_trail_segment("aircraft", start, Vector2D(next_pos.x, next_pos.y), s.tick)
-        exit_tile = crossed_exit_tile(ac.position, next_pos, s.grid)
-        if exit_tile is not None and exit_tile in self.pva_locked_exit_tiles:
+        prev = Vector2D(ac.position.x, ac.position.y)
+        ac.position = next_pos
+        allowed, exit_tile, edge, coord = exit_crossing_allowed(
+            prev,
+            next_pos,
+            s.grid,
+            frozenset(self.pva_locked_exit_tiles),
+            float(C.PVA_EXIT_TOLERANCE_TILES),
+        )
+        if allowed:
             s.escaped = True
             self.pva_phase = self.PVA_END
             self.pva_result_text = "ESCAPED"
             self.last_action = f"ESCAPED via {exit_tile}"
         else:
+            valid_on_edge: list[tuple[int, int]] = []
+            if edge is None and exit_tile is not None:
+                ex, ey = exit_tile
+                if ex == 0:
+                    edge = "left"
+                elif ex == s.grid.width - 1:
+                    edge = "right"
+                elif ey == 0:
+                    edge = "top"
+                elif ey == s.grid.height - 1:
+                    edge = "bottom"
+            if edge == "top":
+                valid_on_edge = sorted([t for t in self.pva_locked_exit_tiles if t[1] == 0])
+            elif edge == "bottom":
+                valid_on_edge = sorted([t for t in self.pva_locked_exit_tiles if t[1] == s.grid.height - 1])
+            elif edge == "left":
+                valid_on_edge = sorted([t for t in self.pva_locked_exit_tiles if t[0] == 0])
+            elif edge == "right":
+                valid_on_edge = sorted([t for t in self.pva_locked_exit_tiles if t[0] == s.grid.width - 1])
+            print(
+                "[pva-exit-fail] "
+                f"edge={edge} coord={coord} rounded={exit_tile} "
+                f"rounded_allowed={exit_tile in self.pva_locked_exit_tiles if exit_tile is not None else False} "
+                f"valid={valid_on_edge} tol={float(C.PVA_EXIT_TOLERANCE_TILES):.2f}"
+            )
             s.failed = True
             self.pva_phase = self.PVA_END
             self.pva_result_text = "ILLEGAL EXIT"

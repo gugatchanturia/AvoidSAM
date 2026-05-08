@@ -502,7 +502,7 @@ def crossed_exit_tile(prev_pos: Vector2D, next_pos: Vector2D, grid: Grid) -> Til
             y = prev_pos.y + t_left * dy
             if -_EPS <= y <= grid.height - 1 + _EPS:
                 candidates.append((t_left, "left", y))
-        t_right = ((grid.width - 1) - prev_pos.x) / dx
+        t_right = (float(grid.width) - prev_pos.x) / dx
         if _EPS < t_right <= 1.0 + _EPS:
             y = prev_pos.y + t_right * dy
             if -_EPS <= y <= grid.height - 1 + _EPS:
@@ -514,7 +514,7 @@ def crossed_exit_tile(prev_pos: Vector2D, next_pos: Vector2D, grid: Grid) -> Til
             x = prev_pos.x + t_top * dx
             if -_EPS <= x <= grid.width - 1 + _EPS:
                 candidates.append((t_top, "top", x))
-        t_bottom = ((grid.height - 1) - prev_pos.y) / dy
+        t_bottom = (float(grid.height) - prev_pos.y) / dy
         if _EPS < t_bottom <= 1.0 + _EPS:
             x = prev_pos.x + t_bottom * dx
             if -_EPS <= x <= grid.width - 1 + _EPS:
@@ -540,3 +540,84 @@ def crossed_exit_tile(prev_pos: Vector2D, next_pos: Vector2D, grid: Grid) -> Til
     if edge == "top":
         return (max(0, min(grid.width - 1, idx)), 0)
     return (max(0, min(grid.width - 1, idx)), grid.height - 1)
+
+
+def exit_crossing_allowed(
+    prev_pos: Vector2D,
+    next_pos: Vector2D,
+    grid: Grid,
+    valid_exit_tiles: frozenset[Tile],
+    tolerance_tiles: float,
+) -> tuple[bool, Tile | None, str | None, float | None]:
+    """
+    Continuous exit validation for PVA: allow near-edge crossings even when rounding would
+    pick a neighboring tile.
+    """
+    dx = next_pos.x - prev_pos.x
+    dy = next_pos.y - prev_pos.y
+    candidates: list[tuple[float, str, float]] = []
+
+    if abs(dx) > _EPS:
+        t_left = (0.0 - prev_pos.x) / dx
+        if _EPS < t_left <= 1.0 + _EPS:
+            y = prev_pos.y + t_left * dy
+            if -_EPS <= y <= grid.height - 1 + _EPS:
+                candidates.append((t_left, "left", y))
+        t_right = ((grid.width - 1) - prev_pos.x) / dx
+        if _EPS < t_right <= 1.0 + _EPS:
+            y = prev_pos.y + t_right * dy
+            if -_EPS <= y <= grid.height - 1 + _EPS:
+                candidates.append((t_right, "right", y))
+
+    if abs(dy) > _EPS:
+        t_top = (0.0 - prev_pos.y) / dy
+        if _EPS < t_top <= 1.0 + _EPS:
+            x = prev_pos.x + t_top * dx
+            if -_EPS <= x <= grid.width - 1 + _EPS:
+                candidates.append((t_top, "top", x))
+        t_bottom = ((grid.height - 1) - prev_pos.y) / dy
+        if _EPS < t_bottom <= 1.0 + _EPS:
+            x = prev_pos.x + t_bottom * dx
+            if -_EPS <= x <= grid.width - 1 + _EPS:
+                candidates.append((t_bottom, "bottom", x))
+
+    if not candidates:
+        rounded = crossed_exit_tile(prev_pos, next_pos, grid)
+        if rounded is not None and rounded in valid_exit_tiles:
+            x, y = rounded
+            inferred_edge: str | None = None
+            if x == 0:
+                inferred_edge = "left"
+            elif x == grid.width - 1:
+                inferred_edge = "right"
+            elif y == 0:
+                inferred_edge = "top"
+            elif y == grid.height - 1:
+                inferred_edge = "bottom"
+            inferred_coord: float | None = None
+            if inferred_edge in ("left", "right"):
+                inferred_coord = float(y)
+            elif inferred_edge in ("top", "bottom"):
+                inferred_coord = float(x)
+            return (True, rounded, inferred_edge, inferred_coord)
+        return (False, rounded, None, None)
+
+    _, edge, coord = min(candidates, key=lambda item: item[0])
+    rounded = crossed_exit_tile(prev_pos, next_pos, grid)
+
+    if edge == "top":
+        valid_idx = sorted({x for (x, y) in valid_exit_tiles if y == 0})
+    elif edge == "bottom":
+        valid_idx = sorted({x for (x, y) in valid_exit_tiles if y == grid.height - 1})
+    elif edge == "left":
+        valid_idx = sorted({y for (x, y) in valid_exit_tiles if x == 0})
+    else:  # right
+        valid_idx = sorted({y for (x, y) in valid_exit_tiles if x == grid.width - 1})
+
+    if not valid_idx:
+        return (False, rounded, edge, float(coord))
+
+    tol = max(0.0, float(tolerance_tiles))
+    half = 0.5 + tol
+    allowed = any((i - half) <= coord <= (i + half) for i in valid_idx)
+    return (bool(allowed), rounded, edge, float(coord))

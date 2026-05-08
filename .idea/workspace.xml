@@ -1,8 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="26c96aaa-5260-48e6-acd3-c46de89ad4ae" name="Changes" comment="Add PVA jammer turn blocking">
-      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
+    <list default="true" id="26c96aaa-5260-48e6-acd3-c46de89ad4ae" name="Changes" comment="Stabilize PVA launch filtering and plan validation">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/game/app.py" beforeDir="false" afterPath="$PROJECT_DIR$/game/app.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/game/pva_rules.py" beforeDir="false" afterPath="$PROJECT_DIR$/game/pva_rules.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -92,7 +94,7 @@
       <workItem from="1777451710042" duration="23775000" />
       <workItem from="1777840467083" duration="1025000" />
       <workItem from="1777958834927" duration="78000" />
-      <workItem from="1778073948103" duration="1902000" />
+      <workItem from="1778073948103" duration="3248000" />
     </task>
     <task id="LOCAL-00001" summary="Initial working simulation: movement, prediction, interception, basic AI">
       <option name="closed" value="true" />
@@ -126,7 +128,23 @@
       <option name="project" value="LOCAL" />
       <updated>1778251823582</updated>
     </task>
-    <option name="localTasksCounter" value="5" />
+    <task id="LOCAL-00005" summary="WIP: add basic jammer blocking, trails, and initial jammer-aware SAM reranking">
+      <option name="closed" value="true" />
+      <created>1778253940822</created>
+      <option name="number" value="00005" />
+      <option name="presentableId" value="LOCAL-00005" />
+      <option name="project" value="LOCAL" />
+      <updated>1778253940822</updated>
+    </task>
+    <task id="LOCAL-00006" summary="Stabilize PVA launch filtering and plan validation">
+      <option name="closed" value="true" />
+      <created>1778254799056</created>
+      <option name="number" value="00006" />
+      <option name="presentableId" value="LOCAL-00006" />
+      <option name="project" value="LOCAL" />
+      <updated>1778254799056</updated>
+    </task>
+    <option name="localTasksCounter" value="7" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -148,12 +166,14 @@
     <MESSAGE value="Implement analytic intercept planner with plan persistence and predictor abstraction&#10;&#10;- Replaced brute-force missile search with analytic quadratic intercept solve&#10;- Added radius-aware interception logic (HIT_RADIUS integrated correctly)&#10;- Introduced snap + neighbour verification with safe full fallback&#10;- Implemented plan persistence to avoid per-tick replanning&#10;- Added TargetPredictor abstraction (ConstantVelocityPredictor)&#10;- Prepared architecture for future single-turn player evasion&#10;- Reduced planner runtime from hundreds of ms per tick to near-zero after first plan&#10;- Improved diagnostics and planner performance visibility&#10;&#10;Result: Major performance improvement and stable interception behavior across scenarios" />
     <MESSAGE value="Improve PVA balance and SAM-aware launch rules" />
     <MESSAGE value="Add PVA jammer turn blocking" />
-    <option name="LAST_COMMIT_MESSAGE" value="Add PVA jammer turn blocking" />
+    <MESSAGE value="WIP: add basic jammer blocking, trails, and initial jammer-aware SAM reranking" />
+    <MESSAGE value="Stabilize PVA launch filtering and plan validation" />
+    <option name="LAST_COMMIT_MESSAGE" value="Stabilize PVA launch filtering and plan validation" />
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/AvoidSAM$launch_system.coverage" NAME="launch_system Coverage Results" MODIFIED="1777455451423" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/systems" />
     <SUITE FILE_PATH="coverage/AvoidSAM$app.coverage" NAME="app Coverage Results" MODIFIED="1776319279130" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/game" />
     <SUITE FILE_PATH="coverage/AvoidSAM$constants.coverage" NAME="constants Coverage Results" MODIFIED="1776841308856" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/game" />
-    <SUITE FILE_PATH="coverage/AvoidSAM$main.coverage" NAME="main Coverage Results" MODIFIED="1777958842011" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/AvoidSAM$main.coverage" NAME="main Coverage Results" MODIFIED="1778253915175" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
   </component>
 </project>
