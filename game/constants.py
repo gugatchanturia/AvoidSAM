@@ -47,3 +47,9 @@ PVA_SAM_CONSIDER_ONLY_WINNING_TURNS = True
 
 # Bounded turn-aware futures for planner (combined with branching dirs / sampled turn ticks internally).
 TURN_AWARE_MAX_PATHS = 24
+
+# --- SAM Jammer (PVA only) ---
+# Radius in grid tiles (world coordinates). Used only for UI + player turn blocking.
+JAMMER_RADIUS = 4.0
+# If True, jammer stays on after SAM fires its one missile.
+JAMMER_ACTIVE_AFTER_FIRE = True

@@ -44,6 +44,7 @@ COL_TILE_LOCK = (255, 220, 80)
 COL_PREVIEW = (160, 160, 220, 70)
 COL_TURN = (220, 220, 80, 80)
 COL_TURN_HI = (255, 255, 180, 180)
+COL_JAMMER = (255, 60, 60)
 
 
 class Button:
@@ -206,6 +207,18 @@ def draw_turn_wheel(screen, pos: Vector2D, directions: list[DirectionVector], hi
     screen.blit(overlay, (0, 0))
 
 
+def draw_jammer_radius(screen, truck_pos: Vector2D, radius_tiles: float) -> None:
+    if radius_tiles <= 0:
+        return
+    cx = truck_pos.x * CELL_SIZE + CELL_SIZE / 2
+    cy = truck_pos.y * CELL_SIZE + CELL_SIZE / 2
+    rpx = int(round(radius_tiles * CELL_SIZE))
+    overlay = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
+    pygame.draw.circle(overlay, (*COL_JAMMER, 28), (int(cx), int(cy)), rpx)
+    pygame.draw.circle(overlay, (*COL_JAMMER, 120), (int(cx), int(cy)), rpx, 2)
+    screen.blit(overlay, (0, 0))
+
+
 def draw_menu(screen, font, font_small, screen_w, screen_h, buttons: list[Button]) -> None:
     title = font.render("AvoidSAM", True, COL_TEXT)
     subtitle = font_small.render("Choose a mode", True, COL_DIM)
@@ -297,9 +310,14 @@ def draw_pva_panel(screen, app, font, font_small, info_y, ctrl_y, screen_w,
         f"Action={app.last_action or '—'}"
     )
     if app.pva_phase == App.PVA_RUNNING:
+        j_on = "ON" if app.jammer_active() else "OFF"
+        j_yes = "YES" if app.aircraft_jammed() else "NO"
+        j_dist = app.jammer_distance_tiles()
+        j_dist_str = f"{j_dist:.2f}/{float(C.JAMMER_RADIUS):.1f}" if j_dist is not None else "—"
         line3 = (
             f"Valid exits: {len(app.pva_locked_exit_tiles)} tiles  "
             f"Turn UI={len(app.pva_player_turn_dirs)} dirs  SAM threat={len(app.pva_sam_threat_turn_dirs)}  "
+            f"JAMMER={j_on}  JAMMED={j_yes}  JDIST={j_dist_str}  "
             f"Truck plan={app.last_plan_type or '—'}  "
             f"Planner {app.last_planner_ms:.1f}ms"
         )
@@ -542,6 +560,8 @@ def main() -> None:
 
         if app.mode != App.MODE_MENU:
             truck = app.state.sam_truck
+            if app.mode == App.MODE_PVA:
+                draw_jammer_radius(screen, truck.position, float(C.JAMMER_RADIUS))
             draw_truck(screen, truck.position, truck.direction)
 
             if app.mode == App.MODE_AUTOMATIC:
@@ -569,11 +589,13 @@ def main() -> None:
                     and app.pva_phase == App.PVA_RUNNING
                     and not app.pva_turn_used
                     and app.has_aircraft
+                    and app._pva_in_turn_window()
+                    and not app.aircraft_jammed()
                 ):
                     draw_turn_wheel(
                         screen,
                         app.state.aircraft.position,
-                        app.pva_player_turn_dirs,
+                        app.pva_player_turn_dirs if app.pva_player_turn_dirs else list(DIRECTIONS),
                         app.pva_turn_hover_direction,
                     )
 

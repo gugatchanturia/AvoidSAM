@@ -298,6 +298,36 @@ class App:
             return True
         return self.pva_phase in (self.PVA_RUNNING, self.PVA_END)
 
+    # ------------------------------------------------------------------
+    # Jammer (PVA only)
+    # ------------------------------------------------------------------
+
+    def jammer_active(self) -> bool:
+        if self.mode != self.MODE_PVA:
+            return False
+        if float(C.JAMMER_RADIUS) <= 0.0:
+            return False
+        if bool(C.JAMMER_ACTIVE_AFTER_FIRE):
+            return True
+        return not bool(self.state.sam_truck.has_fired)
+
+    def jammer_distance_tiles(self) -> float | None:
+        if self.mode != self.MODE_PVA:
+            return None
+        if self.pva_phase not in (self.PVA_RUNNING, self.PVA_END):
+            return None
+        ac_pos = self.state.aircraft.position
+        truck_pos = self.state.sam_truck.position
+        return ac_pos.distance_to(truck_pos)
+
+    def aircraft_jammed(self) -> bool:
+        if not self.jammer_active():
+            return False
+        dist = self.jammer_distance_tiles()
+        if dist is None:
+            return False
+        return dist <= float(C.JAMMER_RADIUS) + 1e-9
+
     @property
     def pva_border_tiles(self) -> list[tuple[int, int]]:
         return all_border_tiles(self.state.grid)
@@ -351,48 +381,7 @@ class App:
             self.pva_turn_hover_direction = None
             if not self._pva_logged_outside_turn_fan:
                 self._pva_logged_outside_turn_fan = True
-                print(
-                    f"[pva-turn] tick={self.state.tick} player_turn_dirs=0 sam_threat_turn_dirs=0 "
-                    f"window=[{C.TURN_WINDOW_MIN},{C.TURN_WINDOW_MAX}] heading=— hover=None "
-                    f"— outside_turn_window"
-                )
-            return
-
-        self._pva_logged_outside_turn_fan = False
-        ac = self.state.aircraft
-        pos_v = Vector2D(ac.position.x, ac.position.y)
-        vx = frozenset(self.pva_locked_exit_tiles)
-        self.pva_sam_threat_turn_dirs = legal_turn_directions(
-            self.state.grid,
-            pos_v,
-            ac.direction,
-            vx,
-            exit_stripe_half=self.pva_exit_stripe_half,
-            max_turn_angle_deg=None,
-        )
-        if C.PVA_PLAYER_TURN_FREE:
-            self.pva_player_turn_dirs = list(DIRECTIONS)
-        else:
-            self.pva_player_turn_dirs = list(self.pva_sam_threat_turn_dirs)
-
-        self.pva_turn_hover_direction = self._pick_nearest_dir(self.pva_player_turn_dirs, pdx, pdy)
-
-        hi = (
-            self.pva_turn_hover_direction.index
-            if self.pva_turn_hover_direction is not None
-            else -1
-        )
-        key = ("in", len(self.pva_player_turn_dirs), len(self.pva_sam_threat_turn_dirs), hi)
-        if key != self._dbg_turn_fan_key:
-            self._dbg_turn_fan_key = key
-            hname = self._direction_name(self.pva_turn_hover_direction)
-            hd = self._direction_name(ac.direction)
-            msg = (
-                f"[pva-turn] tick={self.state.tick} player_turn_dirs={len(self.pva_player_turn_dirs)} "
-                f"sam_threat_turn_dirs={len(self.pva_sam_threat_turn_dirs)} "
-                f"window=[{C.TURN_WINDOW_MIN},{C.TURN_WINDOW_MAX}] heading={hd} hover={hname}"
-            )
-            if len(self.pva_sam_threat_turn_dirs) == 0:
+                            if len(self.pva_sam_threat_turn_dirs) == 0:
                 why = explain_legal_turn_empty(
                     self.state.grid,
                     pos_v,
@@ -405,8 +394,7 @@ class App:
                     self.pva_turn_used,
                 )
                 msg += f"  sam_threat_empty_why={why}"
-            print(msg)
-
+            
     def _fmt_plan(self, label: str, plan: TruckPlan | None) -> str:
         if plan is None:
             return f"  {label:<28s}: no solution"
@@ -673,7 +661,20 @@ class App:
 
     def update_pva_turn_hover(self, dx: float, dy: float) -> None:
         self._pva_turn_ptr = (dx, dy)
-        self._recompute_pva_turn_fan()
+        if self.mode != self.MODE_PVA or self.pva_phase != self.PVA_RUNNING:
+            return
+        if self.pva_turn_used:
+            return
+        if not self._pva_in_turn_window():
+            self.pva_player_turn_dirs = []
+            self.pva_turn_hover_direction = None
+            return
+        if self.aircraft_jammed():
+            self.pva_player_turn_dirs = []
+            self.pva_turn_hover_direction = None
+            return
+        self.pva_player_turn_dirs = list(DIRECTIONS)
+        self.pva_turn_hover_direction = self._pick_nearest_dir(self.pva_player_turn_dirs, dx, dy)
 
     def pva_left_click(self) -> None:
         if self.mode != self.MODE_PVA:
@@ -755,34 +756,29 @@ class App:
             self._dbg_turn_fan_key = None
             self.pva_turn_hover_direction = None
             self._recompute_pva_turn_fan()
-            print(
-                f"[pva-turn] deployed tick={self.state.tick} "
-                f"player_turn_dirs={len(self.pva_player_turn_dirs)} "
-                f"sam_threat_turn_dirs={len(self.pva_sam_threat_turn_dirs)} "
-                f"window=[{C.TURN_WINDOW_MIN},{C.TURN_WINDOW_MAX}] "
-                f"hover={self._direction_name(self.pva_turn_hover_direction)}"
-            )
             self.last_action = "Aircraft deployed"
             return
 
         if self.pva_phase == self.PVA_RUNNING and not self.pva_turn_used:
+            if self.aircraft_jammed():
+                self.last_action = "TURN BLOCKED BY JAMMER"
+                return
             if not self._pva_in_turn_window():
                 self.last_action = "Turn unavailable"
                 return
             if self.pva_turn_hover_direction is None:
-                return
+                dx, dy = self._pva_turn_ptr
+                pick = self._pick_nearest_dir(list(DIRECTIONS), dx, dy)
+                self.pva_turn_hover_direction = pick if pick is not None else self.state.aircraft.direction
             sel = self.pva_turn_hover_direction
             self.state.aircraft.direction = sel
             self.pva_turn_used = True
+            self.pva_player_turn_dirs = []
+            self.pva_turn_hover_direction = None
             self.active_plan = None
             self._ticks_since_replan = 0
             self._refresh_predictor()
-            print(
-                f"[pva-turn] SELECTED dir={self._direction_name(sel)}  "
-                f"free_turn={bool(C.PVA_PLAYER_TURN_FREE)}  "
-                f"runtime_will_validate_exit=True"
-            )
-            self.last_action = f"TURN {self._direction_name(self.pva_turn_hover_direction)}"
+            self.last_action = f"TURN {self._direction_name(sel)}"
 
     def pva_right_click(self) -> None:
         if self.mode != self.MODE_PVA:
