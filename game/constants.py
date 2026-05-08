@@ -39,6 +39,8 @@ PVA_MIN_LAUNCH_DIRS_CORNER = 3
 
 # Locked exit stripe along the first-hit edge (tiles = 2*stripe_half+1, typically 3–5).
 PVA_EXIT_STRIPE_HALF = 2
+# Continuous tolerance when validating PVA exit crossing vs locked exit stripe.
+PVA_EXIT_TOLERANCE_TILES = 0.35
 
 # Player turn UI: all discrete headings (runtime still validates exit). SAM predictor uses only
 # directions that can still reach locked exits when True.
