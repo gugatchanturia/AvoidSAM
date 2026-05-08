@@ -48,6 +48,14 @@ class PVAPreview:
     exit_tiles: frozenset[tuple[int, int]]
 
 
+@dataclass(frozen=True)
+class TrailSegment:
+    kind: str
+    start: Vector2D
+    end: Vector2D
+    tick: int
+
+
 class App:
     MODE_MENU = "menu"
     MODE_AUTOMATIC = "automatic"
@@ -102,6 +110,9 @@ class App:
         self.pva_turn_used: bool = False
         self.pva_turn_hover_direction: DirectionVector | None = None
         self.pva_result_text: str = ""
+
+        # Visual-only: persistent movement trail segments (cleared per run)
+        self.movement_trails: list[TrailSegment] = []
 
     # ------------------------------------------------------------------
     # Builders / mode entry
@@ -251,6 +262,7 @@ class App:
         self.pva_turn_used = False
         self.pva_turn_hover_direction = None
         self.pva_result_text = ""
+        self.movement_trails = []
 
     # ------------------------------------------------------------------
     # Automatic scenario helpers
@@ -270,6 +282,7 @@ class App:
         self.last_step_ms = 0.0
         self.last_diag = PlannerDiagnostic()
         self._predictor = ConstantVelocityPredictor()
+        self.movement_trails = []
         print(f"\n{'='*64}")
         print(
             f"  Scenario {self.scenario_index + 1}/{len(self.scenarios)}: "
@@ -379,22 +392,8 @@ class App:
             self.pva_player_turn_dirs = []
             self.pva_sam_threat_turn_dirs = []
             self.pva_turn_hover_direction = None
-            if not self._pva_logged_outside_turn_fan:
-                self._pva_logged_outside_turn_fan = True
-                            if len(self.pva_sam_threat_turn_dirs) == 0:
-                why = explain_legal_turn_empty(
-                    self.state.grid,
-                    pos_v,
-                    ac.direction,
-                    vx,
-                    self.pva_exit_stripe_half,
-                    self.state.tick,
-                    int(C.TURN_WINDOW_MIN),
-                    int(C.TURN_WINDOW_MAX),
-                    self.pva_turn_used,
-                )
-                msg += f"  sam_threat_empty_why={why}"
-            
+            return
+
     def _fmt_plan(self, label: str, plan: TruckPlan | None) -> str:
         if plan is None:
             return f"  {label:<28s}: no solution"
@@ -447,6 +446,106 @@ class App:
                 return True
         return False
 
+    def _estimate_truck_pos_after_move_steps(self, plan: TruckPlan) -> Vector2D:
+        """Estimate post-move truck position without mutating state (clamped to bounds)."""
+        s = self.state
+        truck = s.sam_truck
+        pos = Vector2D(truck.position.x, truck.position.y)
+
+        if plan.move_direction is None or plan.move_steps <= 0:
+            return pos
+
+        d = plan.move_direction
+        for _ in range(int(plan.move_steps)):
+            nxt = Vector2D(pos.x + d.x * truck.speed * C.DT, pos.y + d.y * truck.speed * C.DT)
+            pos = nxt if s.grid.in_bounds(nxt) else pos
+        return pos
+
+    def _select_pva_jammer_aware_plan(
+        self,
+        *,
+        fire_now: TruckPlan | None,
+        wait_plan: TruckPlan | None,
+        move_plan: TruckPlan | None,
+        mwf_plan: TruckPlan | None,
+        best: TruckPlan,
+    ) -> TruckPlan:
+        if self.mode != self.MODE_PVA:
+            return best
+        if self.pva_phase != self.PVA_RUNNING:
+            return best
+        if self.pva_turn_used:
+            return best
+        if not self.jammer_active():
+            return best
+        if not self.has_aircraft:
+            return best
+
+        s = self.state
+        if self.inferred_direction is None or self.inferred_speed is None:
+            return best
+
+        ac_pos = Vector2D(s.aircraft.position.x, s.aircraft.position.y)
+        truck_pos = Vector2D(s.sam_truck.position.x, s.sam_truck.position.y)
+        cur_dist = truck_pos.distance_to(ac_pos)
+
+        def qualifies(candidate: TruckPlan | None) -> tuple[float, int, int] | None:
+            if candidate is None:
+                return None
+            if candidate.move_steps <= 0:
+                return None
+            if best.primary_hit and not candidate.primary_hit:
+                return None
+            if int(candidate.intercept_tick) > int(best.intercept_tick) + 4:
+                return None
+            ok = validate_plan(
+                candidate,
+                s.sam_truck,
+                ac_pos,
+                self.inferred_direction,
+                float(self.inferred_speed),
+                C.MISSILE_SPEED,
+                C.DT,
+                s.grid,
+                C.PLANNING_HORIZON,
+                self._predictor,
+                missile_verify_cap=C.MISSILE_MAX_STEPS,
+            )
+            if not ok:
+                return None
+
+            est_pos = self._estimate_truck_pos_after_move_steps(candidate)
+            final_dist = est_pos.distance_to(ac_pos)
+            improvement = cur_dist - final_dist
+            if improvement < 0.25 and final_dist > float(C.JAMMER_RADIUS) + 1e-9:
+                return None
+
+            return (final_dist, int(candidate.intercept_tick), int(candidate.fire_tick))
+
+        best_key: tuple[float, int, int] | None = None
+        best_candidate: TruckPlan | None = None
+        for cand in (fire_now, wait_plan, move_plan, mwf_plan):
+            key = qualifies(cand)
+            if key is None:
+                continue
+            if best_key is None or key < best_key:
+                best_key = key
+                best_candidate = cand
+
+        if best_candidate is None:
+            return best
+        if best_candidate.plan_type == best.plan_type and best_candidate is best:
+            return best
+
+        new_dist = best_key[0] if best_key is not None else cur_dist
+        print(
+            "[jammer-aware] override "
+            f"{best.plan_type} -> {best_candidate.plan_type} "
+            f"dist {cur_dist:.2f} -> {new_dist:.2f} "
+            f"intercept +{int(best_candidate.intercept_tick) - int(best.intercept_tick)}"
+        )
+        return best_candidate
+
     def _replan(self) -> TruckPlan | None:
         s = self.state
         truck = s.sam_truck
@@ -465,6 +564,14 @@ class App:
             missile_verify_cap=C.MISSILE_MAX_STEPS,
             prefer_truck_staging=(self.mode == self.MODE_PVA),
         )
+        if best is not None:
+            best = self._select_pva_jammer_aware_plan(
+                fire_now=fire_now,
+                wait_plan=wait_plan,
+                move_plan=move_plan,
+                mwf_plan=mwf_plan,
+                best=best,
+            )
         self.last_planner_ms = (time.perf_counter() - t0) * 1000.0
         self.last_diag = diag
         self._ticks_since_replan = 0
@@ -510,6 +617,42 @@ class App:
             )
         return best
 
+    def _jammer_pressure_action(self) -> bool:
+        s = self.state
+        truck = s.sam_truck
+        ac = s.aircraft
+
+        dist = self.jammer_distance_tiles()
+        if dist is not None and dist <= float(C.JAMMER_RADIUS) + 1e-9:
+            self.last_action = "jammer pressure (hold)"
+            print(f"  ACTION: jammer pressure hold  dist={dist:.2f} r={float(C.JAMMER_RADIUS):.1f}")
+            return True
+
+        best_d = None
+        best_dist = 1e18
+        for d in DIRECTIONS:
+            nxt = Vector2D(
+                truck.position.x + d.x * truck.speed * C.DT,
+                truck.position.y + d.y * truck.speed * C.DT,
+            )
+            if not s.grid.in_bounds(nxt):
+                continue
+            dd = nxt.distance_to(ac.position)
+            if dd < best_dist:
+                best_dist = dd
+                best_d = d
+
+        if best_d is None:
+            return False
+
+        start = Vector2D(truck.position.x, truck.position.y)
+        truck.direction = best_d
+        move_entity(truck, C.DT, s.grid, state=s)
+        self._record_entity_move("sam", start, truck, s.tick)
+        self.last_action = "jammer pressure"
+        print(f"  ACTION: jammer pressure move  d={self._direction_name(best_d)}")
+        return True
+
     def _apply_truck_action(self) -> TruckPlan | None:
         s = self.state
         truck = s.sam_truck
@@ -537,13 +680,25 @@ class App:
 
         best = self.active_plan
         if best is None:
+            if (
+                self.mode == self.MODE_PVA
+                and self.pva_phase == self.PVA_RUNNING
+                and not self.pva_turn_used
+                and self.has_aircraft
+                and not self.scenario_finished()
+            ):
+                did = self._jammer_pressure_action()
+                if did:
+                    return None
             self.last_action = "idle (no plan)"
             print("  ACTION: idle (no plan)")
             return None
 
         if best.move_steps > 0:
+            start = Vector2D(truck.position.x, truck.position.y)
             truck.direction = best.move_direction
             move_entity(truck, C.DT, s.grid, state=s)
+            self._record_entity_move("sam", start, truck, s.tick)
             self.last_action = f"move {self._direction_name(best.move_direction)}"
             self.active_plan = replace(
                 self._advance_plan_tick_fields(best),
@@ -587,6 +742,17 @@ class App:
             s.failed = True
             print("  *** SCENARIO FAILED — border stall, no solution ***")
 
+    def _append_trail_segment(self, kind: str, start: Vector2D, end: Vector2D, tick: int) -> None:
+        dx = end.x - start.x
+        dy = end.y - start.y
+        if dx * dx + dy * dy <= 1e-12:
+            return
+        self.movement_trails.append(TrailSegment(kind=kind, start=start, end=end, tick=int(tick)))
+
+    def _record_entity_move(self, kind: str, start: Vector2D, ent, tick: int) -> None:
+        end = Vector2D(ent.position.x, ent.position.y)
+        self._append_trail_segment(kind, start, end, tick)
+
     def _run_step_automatic(self) -> None:
         t_step = time.perf_counter()
         s = self.state
@@ -595,9 +761,13 @@ class App:
         self._update_radar()
         best = self._apply_truck_action()
 
+        ac_start = Vector2D(s.aircraft.position.x, s.aircraft.position.y)
         move_entity(s.aircraft, C.DT, s.grid, state=s)
+        self._record_entity_move("aircraft", ac_start, s.aircraft, s.tick)
         for missile in s.missiles:
+            ms = Vector2D(missile.position.x, missile.position.y)
             move_entity(missile, C.DT, s.grid, state=s)
+            self._record_entity_move("missile", ms, missile, s.tick)
         if check_interception(s.aircraft, s.missiles, s.grid):
             s.intercepted = True
         self._update_stall(had_plan=(best is not None))
@@ -808,13 +978,16 @@ class App:
     def _move_pva_aircraft(self) -> None:
         s = self.state
         ac = s.aircraft
+        start = Vector2D(ac.position.x, ac.position.y)
         next_pos = Vector2D(
             ac.position.x + ac.direction.x * ac.speed * C.DT,
             ac.position.y + ac.direction.y * ac.speed * C.DT,
         )
         if s.grid.in_bounds(next_pos):
             ac.position = next_pos
+            self._append_trail_segment("aircraft", start, Vector2D(next_pos.x, next_pos.y), s.tick)
             return
+        self._append_trail_segment("aircraft", start, Vector2D(next_pos.x, next_pos.y), s.tick)
         exit_tile = crossed_exit_tile(ac.position, next_pos, s.grid)
         if exit_tile is not None and exit_tile in self.pva_locked_exit_tiles:
             s.escaped = True
@@ -838,7 +1011,9 @@ class App:
         self._move_pva_aircraft()
         if not (s.failed or s.escaped):
             for missile in s.missiles:
+                ms = Vector2D(missile.position.x, missile.position.y)
                 move_entity(missile, C.DT, s.grid, state=s)
+                self._record_entity_move("missile", ms, missile, s.tick)
             if check_interception(s.aircraft, s.missiles, s.grid):
                 s.intercepted = True
                 self.pva_phase = self.PVA_END

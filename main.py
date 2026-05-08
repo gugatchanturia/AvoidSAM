@@ -77,6 +77,35 @@ def draw_grid(screen, grid) -> None:
         col, w = (COL_GRID_MAJOR, 2) if y % MAJOR_GRID == 0 else (COL_GRID_MINOR, 1)
         pygame.draw.line(screen, col, (0, y * CELL_SIZE), (grid.width * CELL_SIZE, y * CELL_SIZE), w)
 
+def draw_movement_trails(screen, segments) -> None:
+    if not segments:
+        return
+    min_tick = min(seg.tick for seg in segments)
+    max_tick = max(seg.tick for seg in segments)
+    span = max(1, max_tick - min_tick)
+    overlay = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
+    for seg in segments:
+        t = (seg.tick - min_tick) / float(span)
+        a = int(90 + t * (220 - 90))
+        f = 0.65 + 0.35 * t
+        if seg.kind == 'aircraft':
+            base = COL_AIRCRAFT
+            w = 3
+        elif seg.kind == 'sam':
+            base = COL_TRUCK
+            w = 3
+        else:
+            base = COL_MISSILE
+            w = 2
+        col = (int(base[0] * f), int(base[1] * f), int(base[2] * f), a)
+        x0 = int(seg.start.x * CELL_SIZE + CELL_SIZE / 2)
+        y0 = int(seg.start.y * CELL_SIZE + CELL_SIZE / 2)
+        x1 = int(seg.end.x * CELL_SIZE + CELL_SIZE / 2)
+        y1 = int(seg.end.y * CELL_SIZE + CELL_SIZE / 2)
+        pygame.draw.line(overlay, col, (x0, y0), (x1, y1), w)
+    screen.blit(overlay, (0, 0))
+
+
 
 def _rot(pts, cx, cy, a):
     ca, sa = math.cos(a), math.sin(a)
@@ -559,6 +588,7 @@ def main() -> None:
         draw_grid(screen, app.state.grid)
 
         if app.mode != App.MODE_MENU:
+            draw_movement_trails(screen, app.movement_trails)
             truck = app.state.sam_truck
             if app.mode == App.MODE_PVA:
                 draw_jammer_radius(screen, truck.position, float(C.JAMMER_RADIUS))
