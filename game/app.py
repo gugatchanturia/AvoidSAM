@@ -49,6 +49,41 @@ class PVAPreview:
     exit_tiles: frozenset[tuple[int, int]]
 
 
+@dataclass(frozen=True)
+class PVAReplayFrame:
+    """One tick of recorded PVA state for UI replay (no re-simulation)."""
+
+    tick: int
+    aircraft_x: float
+    aircraft_y: float
+    aircraft_dir_index: int
+    truck_x: float
+    truck_y: float
+    truck_dir_index: int
+    truck_has_fired: bool
+    missiles: tuple[tuple[float, float, int, bool], ...]
+    locked_exit_tiles: tuple[tuple[int, int], ...]
+    intercepted: bool
+    escaped: bool
+    failed: bool
+    pva_phase: str
+    pva_result_text: str
+    last_action: str
+    ai_confidence_label: str
+    ai_plan_summary: str
+    ai_explanation: str
+    last_plan_type: str
+    last_planner_ms: float
+    action_policy: str
+    action_policy_reason: str
+    coverage: str
+    futures_hit: int
+    futures_total: int
+    risky_unvalidated: bool
+    ai_future_paths: tuple[tuple[tuple[float, float], ...], ...]
+    pva_turn_used: bool
+
+
 class App:
     MODE_MENU = "menu"
     MODE_AUTOMATIC = "automatic"
@@ -111,6 +146,14 @@ class App:
         self.pva_turn_hover_direction: DirectionVector | None = None
         self.pva_result_text: str = ""
         self._pva_result_logged: bool = False
+        # PVA replay (UI only): recorded per running tick; cleared on new round.
+        self.pva_replay_frames: list[PVAReplayFrame] = []
+        self._pva_replay_snap_policy: str = ""
+        self._pva_replay_snap_reason: str = ""
+        self._pva_replay_snap_coverage: str = "—"
+        self._pva_replay_snap_futures_hit: int = 0
+        self._pva_replay_snap_futures_total: int = 0
+        self._pva_replay_snap_risky: bool = False
 
         self.ai_future_paths: list[list[Vector2D]] = []
         self.ai_confidence_label: str = "LOW"
@@ -278,7 +321,98 @@ class App:
         self.pva_turn_hover_direction = None
         self.pva_result_text = ""
         self._pva_result_logged = False
+        self.pva_replay_frames = []
+        self._pva_clear_replay_snap()
         self._reset_ai_inspector()
+
+    def _pva_clear_replay_snap(self) -> None:
+        self._pva_replay_snap_policy = ""
+        self._pva_replay_snap_reason = ""
+        self._pva_replay_snap_coverage = "—"
+        self._pva_replay_snap_futures_hit = 0
+        self._pva_replay_snap_futures_total = 0
+        self._pva_replay_snap_risky = False
+
+    def _pva_capture_replay_stamp(
+        self,
+        *,
+        policy: str,
+        plan: TruckPlan | None,
+        reason: str,
+    ) -> None:
+        fh = int(getattr(plan, "futures_hit", 0)) if plan is not None else 0
+        ft_raw = int(getattr(plan, "futures_total", 0)) if plan is not None else 0
+        ft = ft_raw if plan is not None else 0
+        cov_s = "—" if plan is None else f"{fh}/{max(ft, 1)}"
+        self._pva_replay_snap_policy = str(policy or "")
+        self._pva_replay_snap_reason = str(reason or "")
+        self._pva_replay_snap_coverage = cov_s
+        self._pva_replay_snap_futures_hit = fh
+        self._pva_replay_snap_futures_total = max(ft, 1) if plan is not None else 0
+        vok = self._pva_last_validate_plan_ok
+        self._pva_replay_snap_risky = vok is False
+
+    def _pva_append_replay_frame(self) -> None:
+        """Append one snapshot after physics for this tick (PVA_RUNNING only enters here via run_step)."""
+        if self.mode != self.MODE_PVA:
+            return
+        s = self.state
+        ac = s.aircraft
+        truck = s.sam_truck
+        missiles: list[tuple[float, float, int, bool]] = []
+        for m in s.missiles:
+            try:
+                missiles.append((float(m.position.x), float(m.position.y), int(m.direction.index), bool(m.active)))
+            except Exception:
+                continue
+        paths_plain: list[tuple[tuple[float, float], ...]] = []
+        for raw in self.ai_future_paths or []:
+            seg: list[tuple[float, float]] = []
+            for pt in raw or []:
+                try:
+                    seg.append((float(pt.x), float(pt.y)))
+                except Exception:
+                    continue
+            if seg:
+                paths_plain.append(tuple(seg))
+            else:
+                paths_plain.append(tuple())
+        locked = tuple(sorted(self.pva_locked_exit_tiles))
+        try:
+            fr = PVAReplayFrame(
+                tick=int(s.tick),
+                aircraft_x=float(ac.position.x),
+                aircraft_y=float(ac.position.y),
+                aircraft_dir_index=int(ac.direction.index),
+                truck_x=float(truck.position.x),
+                truck_y=float(truck.position.y),
+                truck_dir_index=int(truck.direction.index),
+                truck_has_fired=bool(truck.has_fired),
+                missiles=tuple(missiles),
+                locked_exit_tiles=locked,
+                intercepted=bool(s.intercepted),
+                escaped=bool(s.escaped),
+                failed=bool(s.failed),
+                pva_phase=str(self.pva_phase),
+                pva_result_text=str(self.pva_result_text or ""),
+                last_action=str(self.last_action or ""),
+                ai_confidence_label=str(self.ai_confidence_label or ""),
+                ai_plan_summary=str(self.ai_plan_summary or ""),
+                ai_explanation=str(self.ai_explanation or ""),
+                last_plan_type=str(self.last_plan_type or ""),
+                last_planner_ms=float(self.last_planner_ms),
+                action_policy=str(self._pva_replay_snap_policy or ""),
+                action_policy_reason=str(self._pva_replay_snap_reason or ""),
+                coverage=str(self._pva_replay_snap_coverage or "—"),
+                futures_hit=int(self._pva_replay_snap_futures_hit),
+                futures_total=int(max(1, self._pva_replay_snap_futures_total)),
+                risky_unvalidated=bool(self._pva_replay_snap_risky),
+                ai_future_paths=tuple(tuple(p) for p in paths_plain),
+                pva_turn_used=bool(self.pva_turn_used),
+            )
+            self.pva_replay_frames.append(fr)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Automatic scenario helpers
@@ -804,6 +938,7 @@ class App:
         ) -> None:
             if not (self.mode == self.MODE_PVA and self.pva_phase == self.PVA_RUNNING):
                 return
+            self._pva_capture_replay_stamp(policy=policy, plan=plan, reason=reason)
             fh = int(getattr(plan, "futures_hit", 0)) if plan is not None else 0
             ft_raw = int(getattr(plan, "futures_total", 0)) if plan is not None else 0
             ft = max(ft_raw, 1) if plan is not None else 0
@@ -822,6 +957,12 @@ class App:
         self._refresh_predictor()
 
         if truck.has_fired:
+            if self.mode == self.MODE_PVA and self.pva_phase == self.PVA_RUNNING:
+                self._pva_capture_replay_stamp(
+                    policy="OBSERVING",
+                    plan=None,
+                    reason="Missile is in flight; observing the outcome.",
+                )
             return None
 
         if self.inferred_direction is None or self.inferred_speed is None:
@@ -831,6 +972,12 @@ class App:
             self.ai_confidence_label = "LOW"
             self.ai_explanation = "Waiting for radar lock before planning an intercept."
             self.ai_plan_summary = "AI LOW | Waiting for radar lock"
+            if self.mode == self.MODE_PVA and self.pva_phase == self.PVA_RUNNING:
+                self._pva_capture_replay_stamp(
+                    policy="WAITING_RADAR",
+                    plan=None,
+                    reason="Waiting for radar lock before planning an intercept.",
+                )
             return None
 
         # Experiment (PVA only): before firing, replan every tick for maximum reactivity.
@@ -978,6 +1125,12 @@ class App:
             missile = launch_missile_in_direction(truck, C.MISSILE_SPEED, best.fire_direction)
             if missile is not None:
                 s.missiles.append(missile)
+                if self.mode == self.MODE_PVA and self.pva_phase == self.PVA_RUNNING:
+                    self._pva_capture_replay_stamp(
+                        policy="FIRED",
+                        plan=best,
+                        reason="Executing planner plan: firing step.",
+                    )
                 self.last_action = f"FIRED {self._direction_name(best.fire_direction)}"
                 print(f"  ACTION: >>> FIRED  tick={s.tick}")
             self.active_plan = None
@@ -1451,6 +1604,29 @@ class App:
             print(f"\n*** ESCAPED at tick {s.tick}! ***\n")
         elif s.failed:
             print(f"\n*** FAILED at tick {s.tick}! ***\n")
+
+        if self.mode == self.MODE_PVA:
+            if self.pva_result_text:
+                rt = str(self.pva_result_text).upper()
+                if "INTERCEPTED" in rt:
+                    self._pva_capture_replay_stamp(
+                        policy="INTERCEPTED",
+                        plan=None,
+                        reason="Round ended: missile intercepted the aircraft.",
+                    )
+                elif "ESCAPED" in rt or s.escaped:
+                    self._pva_capture_replay_stamp(
+                        policy="ESCAPED",
+                        plan=None,
+                        reason="Round ended: you escaped through the valid corridor.",
+                    )
+                elif "ILLEGAL" in rt or (s.failed and not s.intercepted):
+                    self._pva_capture_replay_stamp(
+                        policy="ILLEGAL_EXIT",
+                        plan=None,
+                        reason="Round ended: exit outside the green corridor.",
+                    )
+            self._pva_append_replay_frame()
 
     # ------------------------------------------------------------------
     # Public tick runner
