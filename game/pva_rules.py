@@ -809,6 +809,89 @@ def crossed_exit_tile(prev_pos: Vector2D, next_pos: Vector2D, grid: Grid) -> Til
     return (max(0, min(grid.width - 1, idx)), grid.height - 1)
 
 
+def segment_crosses_locked_exit_display(
+    grid: Grid,
+    prev_pos: Vector2D,
+    next_pos: Vector2D,
+    locked_exit_tiles: frozenset[Tile],
+) -> tuple[bool, Tile | None, str]:
+    """
+    Visual/UX-consistent escape check.
+
+    Rendering maps world (x,y) to pixels as: px = x*CELL + CELL/2, py = y*CELL + CELL/2.
+    Therefore the visible board border (where the preview line visually "hits") is the rectangle:
+      x in [-0.5, w-0.5], y in [-0.5, h-0.5]
+
+    Each locked border tile corresponds to a visible border *segment*:
+    - bottom (x, h-1): y = h-0.5, x interval [x-0.5, x+0.5]
+    - top    (x, 0) : y = -0.5, x interval [x-0.5, x+0.5]
+    - left   (0, y) : x = -0.5, y interval [y-0.5, y+0.5]
+    - right  (w-1,y): x = w-0.5, y interval [y-0.5, y+0.5]
+
+    Returns (in_locked, visual_tile, edge). If there is no intersection with the visible border,
+    returns (False, None, "").
+    """
+    if not locked_exit_tiles:
+        return (False, None, "")
+
+    w = float(grid.width)
+    h = float(grid.height)
+    xmin, xmax = -0.5, w - 0.5
+    ymin, ymax = -0.5, h - 0.5
+
+    dx = next_pos.x - prev_pos.x
+    dy = next_pos.y - prev_pos.y
+    if abs(dx) < _EPS and abs(dy) < _EPS:
+        return (False, None, "")
+
+    candidates: list[tuple[float, str, float]] = []
+
+    # Vertical borders (x = const): store varying coordinate as y.
+    if abs(dx) > _EPS:
+        t_left = (xmin - prev_pos.x) / dx
+        if _EPS < t_left <= 1.0 + _EPS:
+            y = prev_pos.y + t_left * dy
+            if ymin - 1e-6 <= y <= ymax + 1e-6:
+                candidates.append((t_left, "left", y))
+        t_right = (xmax - prev_pos.x) / dx
+        if _EPS < t_right <= 1.0 + _EPS:
+            y = prev_pos.y + t_right * dy
+            if ymin - 1e-6 <= y <= ymax + 1e-6:
+                candidates.append((t_right, "right", y))
+
+    # Horizontal borders (y = const): store varying coordinate as x.
+    if abs(dy) > _EPS:
+        t_top = (ymin - prev_pos.y) / dy
+        if _EPS < t_top <= 1.0 + _EPS:
+            x = prev_pos.x + t_top * dx
+            if xmin - 1e-6 <= x <= xmax + 1e-6:
+                candidates.append((t_top, "top", x))
+        t_bottom = (ymax - prev_pos.y) / dy
+        if _EPS < t_bottom <= 1.0 + _EPS:
+            x = prev_pos.x + t_bottom * dx
+            if xmin - 1e-6 <= x <= xmax + 1e-6:
+                candidates.append((t_bottom, "bottom", x))
+
+    if not candidates:
+        return (False, None, "")
+
+    t_hit, edge, coord = min(candidates, key=lambda item: item[0])
+    # Convert continuous border coordinate to the visible tile segment index:
+    # interval [i-0.5, i+0.5] -> i = floor(coord + 0.5)
+    idx = int(math.floor(float(coord) + 0.5))
+
+    if edge in ("top", "bottom"):
+        idx = max(0, min(grid.width - 1, idx))
+        y_tile = 0 if edge == "top" else grid.height - 1
+        tile: Tile = (idx, y_tile)
+    else:
+        idx = max(0, min(grid.height - 1, idx))
+        x_tile = 0 if edge == "left" else grid.width - 1
+        tile = (x_tile, idx)
+
+    return (tile in locked_exit_tiles, tile, edge)
+
+
 def _discrete_exit_stripe_and_steps(
     grid: Grid,
     start: Vector2D,
