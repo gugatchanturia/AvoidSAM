@@ -1,5 +1,9 @@
 import colorsys
 import math
+import sys
+from datetime import datetime
+from pathlib import Path
+
 import pygame
 
 from core.directions import DirectionVector, DIRECTIONS
@@ -7,6 +11,20 @@ from core.vector import Vector2D
 from game.app import App
 from game import constants as C
 from game.pva_rules import all_border_tiles, is_border_tile
+
+
+class Tee:
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for stream in self._streams:
+            stream.write(data)
+
+    def flush(self):
+        for stream in self._streams:
+            stream.flush()
+
 
 CELL_SIZE = 38
 INFO_HEIGHT = 96
@@ -192,6 +210,57 @@ def draw_preview_path(screen, grid, origin_tile: tuple[int, int], direction: Dir
         screen.blit(overlay, (0, 0))
 
 
+def draw_future_paths(screen, paths) -> None:
+    if paths is None:
+        return
+    if len(paths) == 0:
+        return
+    try:
+        ww, hh = screen.get_size()
+        overlay = pygame.Surface((ww, hh), pygame.SRCALPHA)
+    except Exception:
+        return
+
+    muted = (
+        (100, 150, 220, 50),
+        (140, 120, 200, 48),
+        (120, 200, 180, 46),
+        (200, 150, 120, 44),
+        (160, 160, 200, 52),
+    )
+
+    for pi, raw_path in enumerate(paths[:5]):
+        if raw_path is None or len(raw_path) < 2:
+            continue
+        pts: list[tuple[float, float]] = []
+        for pos in raw_path:
+            px = getattr(pos, "x", None)
+            py = getattr(pos, "y", None)
+            if px is None or py is None:
+                pts = []
+                break
+            try:
+                cx = float(px) * CELL_SIZE + CELL_SIZE / 2
+                cy = float(py) * CELL_SIZE + CELL_SIZE / 2
+            except Exception:
+                pts = []
+                break
+            pts.append((cx, cy))
+
+        if len(pts) < 2:
+            continue
+        col = muted[pi % len(muted)]
+        try:
+            pygame.draw.lines(overlay, col, False, pts, 2)
+        except Exception:
+            pass
+
+    try:
+        screen.blit(overlay, (0, 0))
+    except Exception:
+        pass
+
+
 def draw_turn_wheel(screen, pos: Vector2D, directions: list[DirectionVector], highlight: DirectionVector | None) -> None:
     cx = pos.x * CELL_SIZE + CELL_SIZE / 2
     cy = pos.y * CELL_SIZE + CELL_SIZE / 2
@@ -309,10 +378,20 @@ def draw_pva_panel(screen, app, font, font_small, info_y, ctrl_y, screen_w,
             f"Valid exits: {len(preview.exit_tiles)}  "
             f"LMB confirm / RMB back"
         )
-    line4 = (
-        f"step={app.last_step_ms:.1f}ms  rfps={render_fps:.0f}  "
-        f"cands={app.last_diag.candidates_evaluated}  ver={app.last_diag.directions_verified}"
+
+    diag = app.last_diag
+    perf_bits = (
+        f"stp={app.last_step_ms:.1f}ms rfps={render_fps:.0f} "
+        f"cands={diag.candidates_evaluated} ver={diag.directions_verified}"
     )
+    ai_raw = getattr(app, "ai_plan_summary", "") or ""
+    ai_raw = ai_raw.strip() if isinstance(ai_raw, str) else ""
+    avail = max(72, screen_w // 22)
+    if ai_raw:
+        short_ai = ai_raw[:avail].rstrip()
+        line4 = f"{short_ai}  ·  {perf_bits}"
+    else:
+        line4 = perf_bits
 
     screen.blit(font.render(line1, True, sc), (10, info_y + 3))
     screen.blit(font_small.render(line2, True, COL_TEXT), (10, info_y + 23))
@@ -361,7 +440,7 @@ def _dir_str(d: DirectionVector | None) -> str:
     return f"{math.degrees(math.atan2(d.y, d.x)) % 360:.0f}°"
 
 
-def main() -> None:
+def _run_app() -> None:
     pygame.init()
     app = App()
     s = app.state
@@ -540,6 +619,10 @@ def main() -> None:
         screen.fill(COL_BG)
         draw_grid(screen, app.state.grid)
 
+        if app.mode == App.MODE_PVA and app.pva_phase == App.PVA_RUNNING:
+            fps = getattr(app, "ai_future_paths", [])
+            draw_future_paths(screen, fps)
+
         if app.mode != App.MODE_MENU:
             truck = app.state.sam_truck
             draw_truck(screen, truck.position, truck.direction)
@@ -596,6 +679,24 @@ def main() -> None:
         pygame.display.flip()
 
     pygame.quit()
+
+
+def main() -> None:
+    logs_dir = Path("logs")
+    logs_dir.mkdir(exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_path = logs_dir / f"run_{stamp}.txt"
+    log_file = open(log_path, "w", encoding="utf-8")
+    stdout_orig = sys.stdout
+    stderr_orig = sys.stderr
+    sys.stdout = Tee(stdout_orig, log_file)
+    sys.stderr = Tee(stderr_orig, log_file)
+    try:
+        _run_app()
+    finally:
+        sys.stdout = stdout_orig
+        sys.stderr = stderr_orig
+        log_file.close()
 
 
 if __name__ == "__main__":

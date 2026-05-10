@@ -103,6 +103,18 @@ class App:
         self.pva_turn_hover_direction: DirectionVector | None = None
         self.pva_result_text: str = ""
 
+        self.ai_future_paths: list[list[Vector2D]] = []
+        self.ai_confidence_label: str = "LOW"
+        self.ai_explanation: str = "Waiting for planner."
+        self.ai_plan_summary: str = "AI LOW | Waiting for planner"
+        self._reset_ai_inspector()
+
+    def _reset_ai_inspector(self) -> None:
+        self.ai_future_paths = []
+        self.ai_confidence_label = "LOW"
+        self.ai_explanation = "Waiting for planner."
+        self.ai_plan_summary = "AI LOW | Waiting for planner"
+
     # ------------------------------------------------------------------
     # Builders / mode entry
     # ------------------------------------------------------------------
@@ -212,6 +224,7 @@ class App:
         self.last_diag = PlannerDiagnostic()
         self.last_planner_ms = 0.0
         self.last_step_ms = 0.0
+        self._reset_ai_inspector()
 
     def start_automatic_mode(self) -> None:
         self.mode = self.MODE_AUTOMATIC
@@ -251,6 +264,7 @@ class App:
         self.pva_turn_used = False
         self.pva_turn_hover_direction = None
         self.pva_result_text = ""
+        self._reset_ai_inspector()
 
     # ------------------------------------------------------------------
     # Automatic scenario helpers
@@ -270,6 +284,7 @@ class App:
         self.last_step_ms = 0.0
         self.last_diag = PlannerDiagnostic()
         self._predictor = ConstantVelocityPredictor()
+        self._reset_ai_inspector()
         print(f"\n{'='*64}")
         print(
             f"  Scenario {self.scenario_index + 1}/{len(self.scenarios)}: "
@@ -407,6 +422,114 @@ class App:
                 msg += f"  sam_threat_empty_why={why}"
             print(msg)
 
+    def _plan_display_name(self, plan_type: str) -> str:
+        mapping = {
+            "fire_now": "Fire now",
+            "wait_then_fire": "Wait, then fire",
+            "move_then_fire": "Reposition, then fire",
+            "move_then_wait_then_fire": "Reposition, wait, then fire",
+        }
+        return mapping.get(plan_type, plan_type.replace("_", " "))
+
+    def _build_ai_inspector(self, best: TruckPlan | None, diag: PlannerDiagnostic) -> None:
+        if self.inferred_direction is None or self.inferred_speed is None:
+            self.ai_future_paths = []
+            self.ai_confidence_label = "LOW"
+            self.ai_plan_summary = "AI LOW | Waiting for radar lock"
+            self.ai_explanation = "Waiting for radar lock before planning an intercept."
+            return
+
+        futures_raw: object = []
+        try:
+            futures_raw = self._predictor.predict_set(
+                position=Vector2D(self.state.aircraft.position.x, self.state.aircraft.position.y),
+                direction=self.inferred_direction,
+                speed=float(self.inferred_speed),
+                dt=C.DT,
+                grid=self.state.grid,
+                max_steps=C.PLANNING_HORIZON,
+            )
+        except Exception:
+            futures_raw = []
+
+        futures_list: list = []
+        if isinstance(futures_raw, list):
+            futures_list = futures_raw
+        self.ai_future_paths = futures_list[:5] if futures_list else []
+
+        pred_name = getattr(diag, "predictor_name", None)
+        pred_name_str = pred_name if isinstance(pred_name, str) and pred_name else "?"
+
+        if best is None:
+            self.ai_confidence_label = "LOW"
+            ns = getattr(diag, "no_solution_reason", "")
+            rs = ns.strip() if isinstance(ns, str) and ns.strip() else "planner found no safe plan"
+            self.ai_explanation = f"No verified intercept: {rs}"
+            self.ai_plan_summary = f"AI LOW | {pred_name_str} | No verified intercept"
+            tex = self.ai_explanation.replace('"', "'")
+            print(
+                "[ai-explain] "
+                f"confidence=LOW predictor={pred_name_str} plan=none coverage=— primary_hit=False "
+                f'text="{tex}"'
+            )
+            return
+
+        fh = int(getattr(best, "futures_hit", 0))
+        ft = int(getattr(best, "futures_total", 0))
+        cov = fh / ft if ft > 0 else 0.0
+        primary_hit = bool(getattr(best, "primary_hit", False))
+        if primary_hit and cov >= 0.75:
+            confidence = "HIGH"
+        elif primary_hit or cov >= 0.50:
+            confidence = "MEDIUM"
+        else:
+            confidence = "LOW"
+
+        self.ai_confidence_label = confidence
+
+        pit_v = getattr(best, "primary_intercept_tick", 10**9)
+        pit_i = int(pit_v) if isinstance(pit_v, int | float) else 10**9
+        if primary_hit and pit_i < 10**8:
+            primary_seg = f"primary future hit in {pit_i} ticks"
+        else:
+            primary_seg = "primary future not guaranteed"
+
+        plan_raw = getattr(best, "plan_type", "") or ""
+        plan_type_s = plan_raw if isinstance(plan_raw, str) else ""
+
+        if plan_type_s == "fire_now":
+            expl = f"Fire now; {primary_seg}; covers {fh}/{max(ft, 1)} futures."
+        elif plan_type_s == "wait_then_fire":
+            wv = int(getattr(best, "wait_steps", 0))
+            expl = f"Wait {wv} ticks, then fire; {primary_seg}; covers {fh}/{max(ft, 1)} futures."
+        elif plan_type_s == "move_then_fire":
+            mv = int(getattr(best, "move_steps", 0))
+            expl = f"Reposition {mv} ticks, then fire; {primary_seg}; covers {fh}/{max(ft, 1)} futures."
+        elif plan_type_s == "move_then_wait_then_fire":
+            mv = int(getattr(best, "move_steps", 0))
+            wv = int(getattr(best, "wait_steps", 0))
+            expl = (
+                f"Reposition {mv} ticks, wait {wv} ticks, then fire; {primary_seg}; "
+                f"covers {fh}/{max(ft, 1)} futures."
+            )
+        else:
+            dn = self._plan_display_name(plan_type_s)
+            expl = f"{dn}; {primary_seg}; covers {fh}/{max(ft, 1)} futures."
+
+        self.ai_explanation = expl
+
+        tier = "HIGH" if confidence == "HIGH" else ("MED" if confidence == "MEDIUM" else "LOW")
+        pdn = self._plan_display_name(plan_type_s)
+        self.ai_plan_summary = f"AI {tier} | {pred_name_str} | {pdn} | covers {fh}/{max(ft, 1)}"
+
+        tex = expl.replace('"', "'")
+        ph = str(primary_hit).lower()
+        print(
+            "[ai-explain] "
+            f"confidence={confidence} predictor={pred_name_str} plan={plan_type_s} "
+            f"coverage={fh}/{max(ft, 1)} primary_hit={ph} text=\"{tex}\""
+        )
+
     def _fmt_plan(self, label: str, plan: TruckPlan | None) -> str:
         if plan is None:
             return f"  {label:<28s}: no solution"
@@ -520,6 +643,8 @@ class App:
                 f"futures={diag.futures_evaluated}  validate_plan_ok={vok}  "
                 f"no_sol={diag.no_solution_reason or '—'}"
             )
+
+        self._build_ai_inspector(best, diag)
         return best
 
     def _apply_truck_action(self) -> TruckPlan | None:
@@ -532,9 +657,13 @@ class App:
         if truck.has_fired:
             return None
 
-        if self.inferred_direction is None:
+        if self.inferred_direction is None or self.inferred_speed is None:
             self.last_action = f"waiting for radar lock (tick {s.tick})"
             print(f"  ACTION: waiting for radar lock (tick {s.tick})")
+            self.ai_future_paths = []
+            self.ai_confidence_label = "LOW"
+            self.ai_explanation = "Waiting for radar lock before planning an intercept."
+            self.ai_plan_summary = "AI LOW | Waiting for radar lock"
             return None
 
         if self._plan_is_stale():
@@ -749,6 +878,7 @@ class App:
             self.active_plan = None
             self._ticks_since_replan = 0
             self._predictor = ConstantVelocityPredictor()
+            self._reset_ai_inspector()
             self.pva_phase = self.PVA_RUNNING
             self.pva_turn_used = False
             self._pva_turn_ptr = (1.0, 0.0)
