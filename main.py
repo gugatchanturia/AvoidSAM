@@ -1,4 +1,5 @@
 import math
+import os
 import sys
 import textwrap
 from datetime import datetime
@@ -2165,21 +2166,36 @@ def _run_app() -> None:
 
 
 def main() -> None:
-    logs_dir = Path("logs")
-    logs_dir.mkdir(exist_ok=True)
-    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_path = logs_dir / f"run_{stamp}.txt"
-    log_file = open(log_path, "w", encoding="utf-8")
+    """Run the game.
+
+    Quiet by default for smoother Pygame loops (stdout discarded).
+    Use ``AVOIDSAM_VERBOSE_LOGS=1`` for full Tee logging to ``logs/run_*.txt``.
+    """
     stdout_orig = sys.stdout
     stderr_orig = sys.stderr
-    sys.stdout = Tee(stdout_orig, log_file)
-    sys.stderr = Tee(stderr_orig, log_file)
+    verbose = os.environ.get("AVOIDSAM_VERBOSE_LOGS") == "1"
+    log_file = None
+    devnull_fp = None
     try:
+        if verbose:
+            logs_dir = Path("logs")
+            logs_dir.mkdir(exist_ok=True)
+            stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            log_path = logs_dir / f"run_{stamp}.txt"
+            log_file = open(log_path, "w", encoding="utf-8")
+            sys.stdout = Tee(stdout_orig, log_file)
+            sys.stderr = Tee(stderr_orig, log_file)
+        else:
+            devnull_fp = open(os.devnull, "w", encoding="utf-8")
+            sys.stdout = devnull_fp
         _run_app()
     finally:
         sys.stdout = stdout_orig
         sys.stderr = stderr_orig
-        log_file.close()
+        if log_file is not None:
+            log_file.close()
+        if devnull_fp is not None:
+            devnull_fp.close()
 
 
 if __name__ == "__main__":

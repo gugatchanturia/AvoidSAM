@@ -8,8 +8,6 @@ The SAM **observes**, **predicts multiple futures**, and **commits to moves** (s
 
 ## Screenshots
 
-> Add PNGs under **`docs/screenshots/`** (see [Screenshots folder](#screenshots-folder) below). The paths below resolve once those files exist; missing files simply show broken images locally until you add them.
-
 ### Main Gameplay
 
 ![Main gameplay screenshot](docs/screenshots/gameplay.png)
@@ -133,13 +131,30 @@ python main.py
 
 Older 3.x versions may work but are **not** the documented test matrix.
 
+### Logging (performance)
+
+By default, `python main.py` runs in **quiet** mode: hot-loop `print` output on **stdout** is discarded (no `logs/run_*.txt` files are created). **stderr** is unchanged so tracebacks still appear in the terminal.
+
+To restore full session logging (tee **stdout** and **stderr** to `logs/run_<timestamp>.txt`):
+
+```bash
+# macOS / Linux
+AVOIDSAM_VERBOSE_LOGS=1 python main.py
+```
+
+```bat
+REM Windows (cmd)
+set AVOIDSAM_VERBOSE_LOGS=1
+python main.py
+```
+
 ---
 
 ## Project structure (brief)
 
 | Path | Purpose |
 |------|---------|
-| `main.py` | Pygame bootstrap, menus, HUD, drawing, tactical replay chrome, wiring into `App` |
+| `main.py` | Pygame bootstrap, menus, HUD, drawing, tactical replay chrome, wiring into `App` (quiet vs verbose logging; see **Logging** above) |
 | `game/app.py` | Core application state machine, PVA phases, snapshots for replay |
 | `game/pva_rules.py` | Grid / border / corridor rules underpinning placement and escapes |
 | `systems/launch_system.py` | Launcher / missile-side mechanics layered into simulation |
