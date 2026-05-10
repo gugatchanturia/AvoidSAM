@@ -82,6 +82,12 @@ class PVAReplayFrame:
     risky_unvalidated: bool
     ai_future_paths: tuple[tuple[tuple[float, float], ...], ...]
     pva_turn_used: bool
+    # Replay/UI only — frozen snapshot from the launcher commit moment (no gameplay impact).
+    launch_tick: int = -1
+    launch_confidence: str = ""
+    launch_coverage: str = ""
+    launch_plan_type: str = ""
+    launch_policy_snapshot: str = ""
 
 
 class App:
@@ -154,6 +160,11 @@ class App:
         self._pva_replay_snap_futures_hit: int = 0
         self._pva_replay_snap_futures_total: int = 0
         self._pva_replay_snap_risky: bool = False
+        self._pva_replay_launch_tick: int = -1
+        self._pva_replay_launch_confidence: str = ""
+        self._pva_replay_launch_coverage: str = ""
+        self._pva_replay_launch_plan_type: str = ""
+        self._pva_replay_launch_policy_snapshot: str = ""
 
         self.ai_future_paths: list[list[Vector2D]] = []
         self.ai_confidence_label: str = "LOW"
@@ -323,7 +334,15 @@ class App:
         self._pva_result_logged = False
         self.pva_replay_frames = []
         self._pva_clear_replay_snap()
+        self._pva_reset_replay_launch_memo()
         self._reset_ai_inspector()
+
+    def _pva_reset_replay_launch_memo(self) -> None:
+        self._pva_replay_launch_tick = -1
+        self._pva_replay_launch_confidence = ""
+        self._pva_replay_launch_coverage = ""
+        self._pva_replay_launch_plan_type = ""
+        self._pva_replay_launch_policy_snapshot = ""
 
     def _pva_clear_replay_snap(self) -> None:
         self._pva_replay_snap_policy = ""
@@ -378,6 +397,18 @@ class App:
             else:
                 paths_plain.append(tuple())
         locked = tuple(sorted(self.pva_locked_exit_tiles))
+        prev_fired = bool(self.pva_replay_frames and self.pva_replay_frames[-1].truck_has_fired)
+        if truck.has_fired and (not prev_fired):
+            self._pva_replay_launch_tick = int(s.tick)
+            self._pva_replay_launch_confidence = str(self.ai_confidence_label or "").strip()
+            lc = str(self._pva_replay_snap_coverage or "").strip()
+            if not lc or lc == "—":
+                fh0 = int(self._pva_replay_snap_futures_hit)
+                ft0 = int(max(1, self._pva_replay_snap_futures_total))
+                lc = f"{fh0}/{ft0}"
+            self._pva_replay_launch_coverage = lc
+            self._pva_replay_launch_plan_type = str(self.last_plan_type or "").strip()
+            self._pva_replay_launch_policy_snapshot = str(self._pva_replay_snap_policy or "").strip()
         try:
             fr = PVAReplayFrame(
                 tick=int(s.tick),
@@ -409,6 +440,11 @@ class App:
                 risky_unvalidated=bool(self._pva_replay_snap_risky),
                 ai_future_paths=tuple(tuple(p) for p in paths_plain),
                 pva_turn_used=bool(self.pva_turn_used),
+                launch_tick=int(self._pva_replay_launch_tick),
+                launch_confidence=str(self._pva_replay_launch_confidence or ""),
+                launch_coverage=str(self._pva_replay_launch_coverage or ""),
+                launch_plan_type=str(self._pva_replay_launch_plan_type or ""),
+                launch_policy_snapshot=str(self._pva_replay_launch_policy_snapshot or ""),
             )
             self.pva_replay_frames.append(fr)
         except Exception:
