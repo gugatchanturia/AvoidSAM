@@ -13,6 +13,12 @@ from game import constants as C
 from game.pva_rules import all_border_tiles, is_border_tile
 
 
+def debug_print(*args, **kwargs) -> None:
+    """Print only when DEBUG_LOG is True, to reduce terminal I/O during gameplay."""
+    if C.DEBUG_LOG:
+        print(*args, **kwargs)
+
+
 class Tee:
     def __init__(self, *streams):
         self._streams = streams
@@ -298,6 +304,16 @@ class PictureManager:
         self.missile: pygame.Surface | None = None
         self.aircraft_flying: pygame.Surface | None = None
         self.aircraft_crashed: pygame.Surface | None = None
+        
+        # Rotation caches: map direction index -> rotated sprite
+        self.aircraft_flying_rot: dict[int, pygame.Surface] = {}
+        self.aircraft_crashed_rot: dict[int, pygame.Surface] = {}
+        self.sam_loaded_rot: dict[int, pygame.Surface] = {}
+        self.sam_unloaded_rot: dict[int, pygame.Surface] = {}
+        self.missile_rot: dict[int, pygame.Surface] = {}
+        
+        # Grid cache: pre-rendered grid lines for fast blitting
+        self.grid_cache: pygame.Surface | None = None
 
     def _warn_once(self, key: str, msg: str) -> None:
         if key in self._warned:
@@ -337,6 +353,55 @@ class PictureManager:
         overlay_max = max(48, min(grid_px_w, grid_px_h, int(min(grid_px_w, grid_px_h) * 0.65)))
         self.win_img = self._load_scaled(base / "win.png", "win.png", overlay_max)
         self.lose_img = self._load_scaled(base / "lose.png", "lose.png", overlay_max)
+        
+        # Pre-rotate all sprites for all directions (performance optimization)
+        self._build_rotation_cache()
+
+    def _build_rotation_cache(self) -> None:
+        """Pre-rotate all sprites for all directions to avoid rotation during draw."""
+        # Clear existing caches
+        self.aircraft_flying_rot.clear()
+        self.aircraft_crashed_rot.clear()
+        self.sam_loaded_rot.clear()
+        self.sam_unloaded_rot.clear()
+        self.missile_rot.clear()
+        
+        # Pre-rotate each sprite for each direction
+        for d in DIRECTIONS:
+            angle = sprite_rotation_degrees(d)
+            if self.aircraft_flying is not None:
+                self.aircraft_flying_rot[d.index] = _rotate_sprite_with_alpha(self.aircraft_flying, angle)
+            if self.aircraft_crashed is not None:
+                self.aircraft_crashed_rot[d.index] = _rotate_sprite_with_alpha(self.aircraft_crashed, angle)
+            if self.sam_loaded is not None:
+                self.sam_loaded_rot[d.index] = _rotate_sprite_with_alpha(self.sam_loaded, angle)
+            if self.sam_unloaded is not None:
+                self.sam_unloaded_rot[d.index] = _rotate_sprite_with_alpha(self.sam_unloaded, angle)
+            if self.missile is not None:
+                self.missile_rot[d.index] = _rotate_sprite_with_alpha(self.missile, angle)
+
+    def build_grid_cache(self, grid) -> None:
+        """Pre-render grid lines to a surface for fast blitting during gameplay."""
+        try:
+            grid_px_w = grid.width * CELL_SIZE
+            grid_px_h = grid.height * CELL_SIZE
+            self.grid_cache = pygame.Surface((grid_px_w, grid_px_h), pygame.SRCALPHA)
+            self.grid_cache.fill(COL_BG)
+            # Draw grid lines to the cache surface
+            for x in range(grid.width + 1):
+                col, w = (COL_GRID_MAJOR, 2) if x % MAJOR_GRID == 0 else (COL_GRID_MINOR, 1)
+                pygame.draw.line(
+                    self.grid_cache, col, (x * CELL_SIZE, 0), (x * CELL_SIZE, grid_px_h), w
+                )
+            for y in range(grid.height + 1):
+                col, w = (COL_GRID_MAJOR, 2) if y % MAJOR_GRID == 0 else (COL_GRID_MINOR, 1)
+                pygame.draw.line(
+                    self.grid_cache, col, (0, y * CELL_SIZE), (grid_px_w, y * CELL_SIZE), w
+                )
+            self.grid_cache = self.grid_cache.convert_alpha()
+        except Exception as e:
+            debug_print(f"[grid-cache] failed to build: {e}")
+            self.grid_cache = None
 
 
 def sprite_rotation_degrees(direction: DirectionVector) -> float:
@@ -367,6 +432,25 @@ def _blit_rotated_sprite(
     rot = _rotate_sprite_with_alpha(base, sprite_rotation_degrees(direction))
     r = rot.get_rect(center=(int(cx), int(cy)))
     screen.blit(rot, r)
+
+
+def _blit_rotated_sprite_cached(
+    screen,
+    cached_sprites: dict[int, pygame.Surface] | None,
+    base: pygame.Surface | None,
+    cx: float,
+    cy: float,
+    direction: DirectionVector,
+    *,
+    fallback_draw,
+) -> None:
+    """Blit a rotated sprite using pre-rotated cache if available, fallback to on-the-fly rotation."""
+    if cached_sprites is not None and direction.index in cached_sprites:
+        rot = cached_sprites[direction.index]
+        r = rot.get_rect(center=(int(cx), int(cy)))
+        screen.blit(rot, r)
+    else:
+        _blit_rotated_sprite(screen, base, cx, cy, direction, fallback_draw=fallback_draw)
 
 
 class Button:
@@ -402,13 +486,18 @@ class Button:
         return self.rect.collidepoint(pos)
 
 
-def draw_grid(screen, grid) -> None:
-    for x in range(grid.width + 1):
-        col, w = (COL_GRID_MAJOR, 2) if x % MAJOR_GRID == 0 else (COL_GRID_MINOR, 1)
-        pygame.draw.line(screen, col, (x * CELL_SIZE, 0), (x * CELL_SIZE, grid.height * CELL_SIZE), w)
-    for y in range(grid.height + 1):
-        col, w = (COL_GRID_MAJOR, 2) if y % MAJOR_GRID == 0 else (COL_GRID_MINOR, 1)
-        pygame.draw.line(screen, col, (0, y * CELL_SIZE), (grid.width * CELL_SIZE, y * CELL_SIZE), w)
+def draw_grid(screen, grid, *, grid_cache: pygame.Surface | None = None) -> None:
+    """Draw grid lines, using pre-rendered cache if available."""
+    if grid_cache is not None:
+        screen.blit(grid_cache, (0, 0))
+    else:
+        # Fallback: draw grid lines directly (slower)
+        for x in range(grid.width + 1):
+            col, w = (COL_GRID_MAJOR, 2) if x % MAJOR_GRID == 0 else (COL_GRID_MINOR, 1)
+            pygame.draw.line(screen, col, (x * CELL_SIZE, 0), (x * CELL_SIZE, grid.height * CELL_SIZE), w)
+        for y in range(grid.height + 1):
+            col, w = (COL_GRID_MAJOR, 2) if y % MAJOR_GRID == 0 else (COL_GRID_MINOR, 1)
+            pygame.draw.line(screen, col, (0, y * CELL_SIZE), (grid.width * CELL_SIZE, y * CELL_SIZE), w)
 
 
 def draw_pva_result_overlay(screen, app: App, pictures: PictureManager | None, grid) -> None:
@@ -510,8 +599,9 @@ def draw_aircraft(
     rot_dir = direction if direction is not None else up_dir
 
     if crashed:
-        _blit_rotated_sprite(
+        _blit_rotated_sprite_cached(
             screen,
+            pictures.aircraft_crashed_rot if pictures is not None else None,
             pictures.aircraft_crashed if pictures is not None else None,
             cx,
             cy,
@@ -521,8 +611,9 @@ def draw_aircraft(
         return
 
     if not has_radar or direction is None:
-        _blit_rotated_sprite(
+        _blit_rotated_sprite_cached(
             screen,
+            pictures.aircraft_flying_rot if pictures is not None else None,
             pictures.aircraft_flying if pictures is not None else None,
             cx,
             cy,
@@ -530,8 +621,9 @@ def draw_aircraft(
             fallback_draw=_fallback_unk,
         )
     else:
-        _blit_rotated_sprite(
+        _blit_rotated_sprite_cached(
             screen,
+            pictures.aircraft_flying_rot if pictures is not None else None,
             pictures.aircraft_flying if pictures is not None else None,
             cx,
             cy,
@@ -560,7 +652,10 @@ def draw_truck(
     base = None
     if pictures is not None:
         base = pictures.sam_unloaded if has_fired else pictures.sam_loaded
-    _blit_rotated_sprite(screen, base, cx, cy, direction, fallback_draw=_fallback)
+    cached = None
+    if pictures is not None:
+        cached = pictures.sam_unloaded_rot if has_fired else pictures.sam_loaded_rot
+    _blit_rotated_sprite_cached(screen, cached, base, cx, cy, direction, fallback_draw=_fallback)
 
 
 def draw_missile(screen, pos, direction, *, pictures: PictureManager | None = None) -> None:
@@ -572,8 +667,9 @@ def draw_missile(screen, pos, direction, *, pictures: PictureManager | None = No
         poly = _rot([(rr, 0), (-rr, -rr * 0.5), (-rr * 0.5, 0), (-rr, rr * 0.5)], cx, cy, angle)
         pygame.draw.polygon(screen, COL_MISSILE, poly)
 
-    _blit_rotated_sprite(
+    _blit_rotated_sprite_cached(
         screen,
+        pictures.missile_rot if pictures is not None else None,
         pictures.missile if pictures is not None else None,
         cx,
         cy,
@@ -1277,7 +1373,7 @@ def draw_tac_replay_side_panel(
 
 def draw_replay_board(surface: pygame.Surface, frame: PVAReplayFrame, pictures: "PictureManager", grid) -> None:
     surface.fill(COL_BG)
-    draw_grid(surface, grid)
+    draw_grid(surface, grid, grid_cache=pictures.grid_cache)
     vpaths: list[list[Vector2D]] = []
     for seg in frame.ai_future_paths:
         if not seg:
@@ -1682,6 +1778,7 @@ def _run_app() -> None:
     sounds.init()
     pictures = PictureManager()
     pictures.load(grid_px_w=grid_px_w, grid_px_h=grid_h)
+    pictures.build_grid_cache(app.state.grid)
 
     menu_buttons = build_menu_buttons(layout_span_w, screen_h)
     auto_ctrl_btns, auto_scen_btns, auto_menu_btn, auto_mute_btn = build_auto_buttons(ctrl_y, layout_span_w)
@@ -1944,7 +2041,7 @@ def _run_app() -> None:
 
         screen.fill(COL_BG)
         if not pva_replay_active:
-            draw_grid(screen, app.state.grid)
+            draw_grid(screen, app.state.grid, grid_cache=pictures.grid_cache if pictures is not None else None)
 
         if app.mode == App.MODE_PVA and (not pva_replay_active) and app.pva_phase == App.PVA_RUNNING:
             fps = getattr(app, "ai_future_paths", [])

@@ -8,13 +8,17 @@ AIRCRAFT_SPEED = 5.0
 MISSILE_SPEED = 3.5
 TRUCK_SPEED = 2.25
 
+# Debug logging: set to True to enable verbose debug output, False for quiet gameplay
+DEBUG_LOG = False
+
 # Missile lifetime: exactly this many successful in-bounds movement ticks before deactivation.
 MISSILE_MAX_STEPS = 96
 
 # Planner lookahead in ticks. Verification is additionally capped by MISSILE_MAX_STEPS in
 # launch_system; PLANNING_HORIZON is deliberately smaller than MISSILE_MAX_STEPS for bounded
 # predictor work at TICK_RATE = 8 while missiles can still fly MISSILE_MAX_STEPS in runtime.
-PLANNING_HORIZON = 40
+# Reduced from 40 to 20 for better performance (still covers most scenarios).
+PLANNING_HORIZON = 20
 
 MAX_STEPS = 120
 
@@ -47,3 +51,13 @@ PVA_SAM_CONSIDER_ONLY_WINNING_TURNS = True
 
 # Bounded turn-aware futures for planner (combined with branching dirs / sampled turn ticks internally).
 TURN_AWARE_MAX_PATHS = 24
+
+# PVA replanning: use interval-based reuse instead of every-tick replanning for performance
+PVA_REPLAN_INTERVAL = 4
+PVA_REPLAN_BUDGET_MS = 12.0
+
+# Planner search size reduction for performance
+# These parameters are passed to predictor_post_turn_candidates; lower values reduce search space
+PVA_PREDICTOR_MAX_PRIMARY = 8
+PVA_PREDICTOR_MAX_TOTAL = 10
+PVA_PREDICTOR_LOOKAHEAD_STEPS = 20

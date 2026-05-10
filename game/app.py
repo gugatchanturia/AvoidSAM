@@ -42,6 +42,12 @@ _STALL_LIMIT = 16
 _REPLAN_INTERVAL = 4
 
 
+def debug_print(*args, **kwargs) -> None:
+    """Print only when DEBUG_LOG is True, to reduce terminal I/O during gameplay."""
+    if C.DEBUG_LOG:
+        print(*args, **kwargs)
+
+
 @dataclass(frozen=True)
 class PVAPreview:
     tile: tuple[int, int] | None
@@ -253,9 +259,9 @@ class App:
                 valid_exit_tiles=vx,
                 speed=spd,
                 dt=float(C.DT),
-                max_primary=12,
-                max_total=18,
-                lookahead_steps=32,
+                max_primary=C.PVA_PREDICTOR_MAX_PRIMARY,
+                max_total=C.PVA_PREDICTOR_MAX_TOTAL,
+                lookahead_steps=C.PVA_PREDICTOR_LOOKAHEAD_STEPS,
                 exit_stripe_half=self.pva_exit_stripe_half,
                 turn_min_remaining=turn_min_remaining,
                 turn_max_remaining=turn_max_remaining,
@@ -860,18 +866,18 @@ class App:
         self.last_diag = diag
         self._ticks_since_replan = 0
 
-        print("  --- Planner ---")
-        print(self._fmt_plan("fire_now", fire_now))
-        print(self._fmt_plan("wait_then_fire", wait_plan))
-        print(self._fmt_plan("move_then_fire", move_plan))
-        print(self._fmt_plan("move_then_wait_then_fire", mwf_plan))
+        debug_print("  --- Planner ---")
+        debug_print(self._fmt_plan("fire_now", fire_now))
+        debug_print(self._fmt_plan("wait_then_fire", wait_plan))
+        debug_print(self._fmt_plan("move_then_fire", move_plan))
+        debug_print(self._fmt_plan("move_then_wait_then_fire", mwf_plan))
         if best is None:
-            print(f"  selected: NONE  [{diag.no_solution_reason}]")
+            debug_print(f"  selected: NONE  [{diag.no_solution_reason}]")
             self.last_plan_type = "none"
         else:
-            print(f"  selected: [{best.plan_type}]  ft={best.fire_tick}  it={best.intercept_tick}")
+            debug_print(f"  selected: [{best.plan_type}]  ft={best.fire_tick}  it={best.intercept_tick}")
             self.last_plan_type = best.plan_type
-        print(
+        debug_print(
             f"  diag: cands={diag.candidates_evaluated}  "
             f"verified={diag.directions_verified}  "
             f"fallback={diag.fallback_used}  planner={self.last_planner_ms:.1f}ms"
@@ -911,7 +917,7 @@ class App:
                 cov_h = "coverage=— coverage_pct=n/a  "
             ltd = ESCAPE_DEBUG_LAST.get("predictor_late_turn_dirs")
             late_turn_n = int(ltd) if isinstance(ltd, (int, float)) else 0
-            print(
+            debug_print(
                 f"  [pva-planner] predictor={diag.predictor_name}  "
                 f"predictor_candidate_dirs={self._pva_last_predictor_candidate_dirs}  "
                 f"strict_turn_dirs={len(self.pva_sam_threat_turn_dirs)}  "
@@ -948,7 +954,7 @@ class App:
             tag = " tag=RISKY_UNVALIDATED" if vok is False else ""
             cov_s = "—" if plan is None else f"{fh}/{ft}"
             safe_reason = reason.replace('"', "'")
-            print(
+            debug_print(
                 "[pva-action-explain] "
                 f"policy={policy}{tag} confidence={confidence} coverage={cov_s} validate={validate_s} "
                 f"reason=\"{safe_reason}\""
@@ -967,7 +973,7 @@ class App:
 
         if self.inferred_direction is None or self.inferred_speed is None:
             self.last_action = f"waiting for radar lock (tick {s.tick})"
-            print(f"  ACTION: waiting for radar lock (tick {s.tick})")
+            debug_print(f"  ACTION: waiting for radar lock (tick {s.tick})")
             self.ai_future_paths = []
             self.ai_confidence_label = "LOW"
             self.ai_explanation = "Waiting for radar lock before planning an intercept."
@@ -980,70 +986,16 @@ class App:
                 )
             return None
 
-        # Experiment (PVA only): before firing, replan every tick for maximum reactivity.
-        # Automatic mode retains the existing reuse interval.
-        if self.mode == self.MODE_PVA and self.pva_phase == self.PVA_RUNNING and not truck.has_fired:
-            # Smoothness: if the previous replan was heavy and we already have a staging plan
-            # (move/wait only), reuse it for one tick instead of replanning again immediately.
-            ap0 = self.active_plan
-            if (
-                ap0 is not None
-                and (int(ap0.move_steps) > 0 or int(ap0.wait_steps) > 0)
-                and float(self.last_planner_ms) > 180.0
-                and bool(self._pva_heavy_skip_armed)
-            ):
-                _pva_action_explain(
-                    policy="HEAVY_REUSE",
-                    plan=ap0,
-                    reason="Reusing one staging step after an expensive planner tick to avoid lag.",
-                )
-                self._pva_heavy_skip_armed = False
-                md0 = self._direction_name(ap0.move_direction) if ap0.move_direction else "NONE"
-                print(
-                    "[pva-replan-skip] reason=heavy_previous_keep_staging "
-                    f"planner_ms={self.last_planner_ms:.1f} plan={ap0.plan_type} "
-                    f"move={md0}x{ap0.move_steps} wait={ap0.wait_steps}"
-                )
-            else:
-                print("[pva-replan] reason=every_tick_before_fire")
-                # Reduce overhead: skip expensive validate_plan() diagnostic most ticks during forced replans.
-                do_validate = (int(s.tick) % 5) == 0
-                new_plan = self._replan(validate_diag=do_validate)
-                if new_plan is not None:
-                    self.active_plan = new_plan
-                    self._pva_heavy_skip_armed = float(self.last_planner_ms) > 180.0
-                elif self.active_plan is not None:
-                    ap = self.active_plan
-                    # Only keep old plans that still have staging steps; never keep an immediate-fire plan.
-                    if int(ap.move_steps) > 0 or int(ap.wait_steps) > 0:
-                        md = self._direction_name(ap.move_direction) if ap.move_direction else "NONE"
-                        fd = self._direction_name(ap.fire_direction)
-                        print(
-                            f"[pva-plan-keep] reason=replan_none keeping={ap.plan_type} "
-                            f"move={md}x{ap.move_steps} wait={ap.wait_steps} fire={fd} fire_tick={ap.fire_tick}"
-                        )
-                    else:
-                        print(
-                            f"[pva-plan-drop] reason=replan_none_old_plan_immediate_fire old={ap.plan_type} "
-                            f"fire_tick={ap.fire_tick} intercept_tick={ap.intercept_tick}"
-                        )
-                        self.active_plan = None
-            # If we still have no plan (or just dropped an unsafe immediate-fire plan), hold.
-            if self.active_plan is None:
-                _pva_action_explain(
-                    policy="NO_PLAN_HOLD",
-                    plan=None,
-                    reason="No verified plan; refuses fake chase movement.",
-                )
-                self.last_action = "idle (no verified plan)"
-                print("[pva-no-plan-hold] reason=no_verified_plan no_chase=True")
-                return None
-        elif self._plan_is_stale():
+        # Interval-based replanning: both PVA and Automatic modes now replan only every
+        # PVA_REPLAN_INTERVAL ticks, unless the plan becomes stale (aircraft changed direction,
+        # old plan became invalid, etc.). This significantly reduces planner CPU usage.
+        if self._plan_is_stale():
+            debug_print(f"[pva-replan] reason=stale_plan (ticks_since={self._ticks_since_replan})")
             self.active_plan = self._replan()
         else:
             self._ticks_since_replan += 1
             ap = self.active_plan
-            print(
+            debug_print(
                 f"  [plan reuse {self._ticks_since_replan}/{_REPLAN_INTERVAL} "
                 f"type={ap.plan_type if ap else 'none'} ft={ap.fire_tick if ap else '?'}]"
             )
@@ -1051,7 +1003,7 @@ class App:
         best = self.active_plan
         if best is None:
             self.last_action = "idle (no plan)"
-            print("  ACTION: idle (no plan)")
+            debug_print("  ACTION: idle (no plan)")
             return None
 
         if best.move_steps > 0:
@@ -1070,7 +1022,7 @@ class App:
                 self._advance_plan_tick_fields(best),
                 move_steps=best.move_steps - 1,
             )
-            print(f"  ACTION: move  ({best.move_steps} steps left)")
+            debug_print(f"  ACTION: move  ({best.move_steps} steps left)")
         elif best.wait_steps > 0:
             policy = "VERIFIED_PLAN"
             if self.ai_confidence_label == "LOW":
@@ -1085,7 +1037,7 @@ class App:
                 self._advance_plan_tick_fields(best),
                 wait_steps=best.wait_steps - 1,
             )
-            print(f"  ACTION: wait  ({best.wait_steps} steps left)")
+            debug_print(f"  ACTION: wait  ({best.wait_steps} steps left)")
         else:
             # PVA policy: before the player uses their one turn, guard against obviously weak
             # immediate-fire plans. Movement/wait plans are always allowed.
@@ -1108,7 +1060,7 @@ class App:
                         reason="Refused a bad shot: LOW confidence and coverage below 0.50.",
                     )
                     self.last_action = "hold fire (weak plan)"
-                    print(
+                    debug_print(
                         "[pva-fire-hold] "
                         f"coverage={fh}/{max(ft,1)} coverage_pct={cov:.3f} "
                         f"confidence={confidence} plan={best.plan_type}"
@@ -1132,7 +1084,7 @@ class App:
                         reason="Executing planner plan: firing step.",
                     )
                 self.last_action = f"FIRED {self._direction_name(best.fire_direction)}"
-                print(f"  ACTION: >>> FIRED  tick={s.tick}")
+                debug_print(f"  ACTION: >>> FIRED  tick={s.tick}")
             self.active_plan = None
         return best
 
@@ -1155,7 +1107,7 @@ class App:
             self._stall_ticks = 0
         if self._stall_ticks >= _STALL_LIMIT:
             s.failed = True
-            print("  *** SCENARIO FAILED — border stall, no solution ***")
+            debug_print("  *** SCENARIO FAILED — border stall, no solution ***")
 
     def _run_step_automatic(self) -> None:
         t_step = time.perf_counter()
@@ -1175,15 +1127,15 @@ class App:
 
         self.last_step_ms = (time.perf_counter() - t_step) * 1000.0
         idir = self._direction_name(self.inferred_direction)
-        print(
+        debug_print(
             f"[Tick {s.tick:>3}]  AC={s.aircraft.position}  idir={idir}  "
             f"truck={truck.position}  fired={truck.has_fired}  "
             f"step={self.last_step_ms:.1f}ms  plan={self.last_planner_ms:.1f}ms"
         )
         for i, m in enumerate(s.missiles):
-            print(f"  M{i}: {m.position}  active={m.active}")
+            debug_print(f"  M{i}: {m.position}  active={m.active}")
         if s.intercepted:
-            print(f"\n*** INTERCEPTED at tick {s.tick}! ***\n")
+            debug_print(f"\n*** INTERCEPTED at tick {s.tick}! ***\n")
 
     # ------------------------------------------------------------------
     # PVA deployment interaction
