@@ -101,6 +101,9 @@ class App:
         self._pva_logged_outside_turn_fan: bool = False
         self._pva_turn_ptr: tuple[float, float] = (1.0, 0.0)
         self._pva_last_predictor_candidate_dirs: int = 0
+        # Smoothness control for forced every-tick PVA replans:
+        # allow at most one "heavy keep staging" skip per heavy replan result.
+        self._pva_heavy_skip_armed: bool = False
         self.pva_turn_used: bool = False
         self.pva_turn_hover_direction: DirectionVector | None = None
         self.pva_result_text: str = ""
@@ -806,7 +809,9 @@ class App:
                 ap0 is not None
                 and (int(ap0.move_steps) > 0 or int(ap0.wait_steps) > 0)
                 and float(self.last_planner_ms) > 180.0
+                and bool(self._pva_heavy_skip_armed)
             ):
+                self._pva_heavy_skip_armed = False
                 md0 = self._direction_name(ap0.move_direction) if ap0.move_direction else "NONE"
                 print(
                     "[pva-replan-skip] reason=heavy_previous_keep_staging "
@@ -814,41 +819,33 @@ class App:
                     f"move={md0}x{ap0.move_steps} wait={ap0.wait_steps}"
                 )
             else:
-            print("[pva-replan] reason=every_tick_before_fire")
-            # Reduce overhead: skip expensive validate_plan() diagnostic most ticks during forced replans.
-            do_validate = (int(s.tick) % 5) == 0
-            new_plan = self._replan(validate_diag=do_validate)
-            if new_plan is not None:
-                self.active_plan = new_plan
-            elif self.active_plan is not None:
-                ap = self.active_plan
-                # Only keep old plans that still have staging steps; never keep an immediate-fire plan.
-                if int(ap.move_steps) > 0 or int(ap.wait_steps) > 0:
-                    md = self._direction_name(ap.move_direction) if ap.move_direction else "NONE"
-                    fd = self._direction_name(ap.fire_direction)
-                    print(
-                        f"[pva-plan-keep] reason=replan_none keeping={ap.plan_type} "
-                        f"move={md}x{ap.move_steps} wait={ap.wait_steps} fire={fd} fire_tick={ap.fire_tick}"
-                    )
-                else:
-                    print(
-                        f"[pva-plan-drop] reason=replan_none_old_plan_immediate_fire old={ap.plan_type} "
-                        f"fire_tick={ap.fire_tick} intercept_tick={ap.intercept_tick}"
-                    )
-                    self.active_plan = None
-            # If we still have no plan (or just dropped an unsafe immediate-fire plan), do a cheap
-            # one-step staging move toward the aircraft instead of freezing.
+                print("[pva-replan] reason=every_tick_before_fire")
+                # Reduce overhead: skip expensive validate_plan() diagnostic most ticks during forced replans.
+                do_validate = (int(s.tick) % 5) == 0
+                new_plan = self._replan(validate_diag=do_validate)
+                if new_plan is not None:
+                    self.active_plan = new_plan
+                    self._pva_heavy_skip_armed = float(self.last_planner_ms) > 180.0
+                elif self.active_plan is not None:
+                    ap = self.active_plan
+                    # Only keep old plans that still have staging steps; never keep an immediate-fire plan.
+                    if int(ap.move_steps) > 0 or int(ap.wait_steps) > 0:
+                        md = self._direction_name(ap.move_direction) if ap.move_direction else "NONE"
+                        fd = self._direction_name(ap.fire_direction)
+                        print(
+                            f"[pva-plan-keep] reason=replan_none keeping={ap.plan_type} "
+                            f"move={md}x{ap.move_steps} wait={ap.wait_steps} fire={fd} fire_tick={ap.fire_tick}"
+                        )
+                    else:
+                        print(
+                            f"[pva-plan-drop] reason=replan_none_old_plan_immediate_fire old={ap.plan_type} "
+                            f"fire_tick={ap.fire_tick} intercept_tick={ap.intercept_tick}"
+                        )
+                        self.active_plan = None
+            # If we still have no plan (or just dropped an unsafe immediate-fire plan), hold.
             if self.active_plan is None:
-                dx = float(s.aircraft.position.x - truck.position.x)
-                dy = float(s.aircraft.position.y - truck.position.y)
-                stage_dir = nearest_direction(dx, dy)
-                truck.direction = stage_dir
-                move_entity(truck, C.DT, s.grid, state=s)
-                self.last_action = "fallback stage"
-                print(
-                    f"[pva-staging-fallback] reason=no_verified_plan dir={self._direction_name(stage_dir)} "
-                    "no_fire=True"
-                )
+                self.last_action = "idle (no verified plan)"
+                print("[pva-no-plan-hold] reason=no_verified_plan no_chase=True")
                 return None
         elif self._plan_is_stale():
             self.active_plan = self._replan()
@@ -896,18 +893,11 @@ class App:
                 fh = int(getattr(best, "futures_hit", 0))
                 ft = int(getattr(best, "futures_total", 0))
                 cov = (fh / ft) if ft > 0 else 0.0
-                primary_hit = bool(getattr(best, "primary_hit", False))
                 confidence = str(self.ai_confidence_label or "")
-                weak = (
-                    (not primary_hit)
-                    or (ft > 1 and cov < 0.50)
-                    or (confidence == "LOW")
-                )
-                if weak:
+                if (confidence == "LOW") and (cov < 0.50):
                     self.last_action = "hold fire (weak plan)"
                     print(
                         "[pva-fire-hold] "
-                        f"reason=weak_plan primary_hit={str(primary_hit).lower()} "
                         f"coverage={fh}/{max(ft,1)} coverage_pct={cov:.3f} "
                         f"confidence={confidence} plan={best.plan_type}"
                     )
