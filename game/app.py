@@ -17,6 +17,7 @@ from game.pva_rules import (
     ESCAPE_DEBUG_LAST,
     all_border_tiles,
     crossed_exit_tile,
+    segment_crosses_locked_exit_display,
     exit_stripe_half_for_pva,
     explain_legal_turn_empty,
     is_border_tile,
@@ -35,7 +36,7 @@ from systems.launch_system import (
     validate_plan,
     launch_missile_in_direction,
 )
-from systems.collision_system import check_interception
+from systems.collision_system import HIT_RADIUS, check_interception
 
 _STALL_LIMIT = 16
 _REPLAN_INTERVAL = 4
@@ -93,7 +94,8 @@ class App:
         self.pva_exit_stripe_half: int = 0
         # Player UI: discrete headings offered on the turn wheel (often all DIRECTIONS).
         self.pva_player_turn_dirs: list[DirectionVector] = []
-        # SAM / predictor: only directions that can still exit via locked tiles (winning futures).
+        # SAM-side "threat" directions: a filtered set used for display/diagnostics and, optionally,
+        # for predictor branching. Player turns can still be all 32 directions when enabled.
         self.pva_sam_threat_turn_dirs: list[DirectionVector] = []
         self._dbg_turn_fan_key: object | None = None
         self._pva_logged_outside_turn_fan: bool = False
@@ -102,6 +104,7 @@ class App:
         self.pva_turn_used: bool = False
         self.pva_turn_hover_direction: DirectionVector | None = None
         self.pva_result_text: str = ""
+        self._pva_result_logged: bool = False
 
         self.ai_future_paths: list[list[Vector2D]] = []
         self.ai_confidence_label: str = "LOW"
@@ -269,6 +272,7 @@ class App:
         self.pva_turn_used = False
         self.pva_turn_hover_direction = None
         self.pva_result_text = ""
+        self._pva_result_logged = False
         self._reset_ai_inspector()
 
     # ------------------------------------------------------------------
@@ -491,6 +495,22 @@ class App:
             confidence = "MEDIUM"
         else:
             confidence = "LOW"
+
+        # Confidence should reflect actual evidence: with no branching, don't claim "HIGH".
+        if ft <= 1:
+            if confidence == "HIGH":
+                confidence = "MEDIUM"
+            if not primary_hit:
+                confidence = "LOW"
+
+        # In PVA, cap "HIGH" when the predictor considered very few post-turn candidates.
+        if (
+            confidence == "HIGH"
+            and self.mode == self.MODE_PVA
+            and self.pva_phase == self.PVA_RUNNING
+            and int(self._pva_last_predictor_candidate_dirs) <= 2
+        ):
+            confidence = "MEDIUM"
 
         self.ai_confidence_label = confidence
 
@@ -765,8 +785,9 @@ class App:
         move_entity(s.aircraft, C.DT, s.grid, state=s)
         for missile in s.missiles:
             move_entity(missile, C.DT, s.grid, state=s)
-        if check_interception(s.aircraft, s.missiles, s.grid):
+        if (not s.intercepted) and check_interception(s.aircraft, s.missiles, s.grid):
             s.intercepted = True
+            self._log_intercept_quality(tick=int(s.tick), mode="automatic")
         self._update_stall(had_plan=(best is not None))
 
         self.last_step_ms = (time.perf_counter() - t_step) * 1000.0
@@ -1013,6 +1034,56 @@ class App:
     # PVA running logic
     # ------------------------------------------------------------------
 
+    def _log_pva_result_once(
+        self,
+        *,
+        result: str,
+        tick: int,
+        crossed: tuple[int, int] | None = None,
+        locked: list[tuple[int, int]] | None = None,
+        action: str = "",
+    ) -> None:
+        if self._pva_result_logged:
+            return
+        self._pva_result_logged = True
+        if result == "INTERCEPTED":
+            print(f'[pva-result] result=INTERCEPTED tick={tick} action="{action}"')
+            return
+        locked_s = locked if locked is not None else []
+        print(
+            f'[pva-result] result={result} tick={tick} crossed={crossed} locked={locked_s} action="{action}"'
+        )
+
+    def _log_intercept_quality(self, *, tick: int, mode: str) -> None:
+        """Logging-only: how close was the interception to HIT_RADIUS."""
+        s = self.state
+        r = float(HIT_RADIUS)
+        if r <= 0:
+            return
+        acp = s.aircraft.position
+        best_dist = float("inf")
+        best_idx = -1
+        for i, m in enumerate(s.missiles):
+            if not getattr(m, "active", False):
+                continue
+            d = acp.distance_to(m.position)
+            if d < best_dist:
+                best_dist = d
+                best_idx = i
+        if best_idx < 0 or not math.isfinite(best_dist):
+            return
+        ratio = best_dist / r
+        if ratio > 0.75:
+            qual = "CLOSE"
+        elif ratio > 0.50:
+            qual = "MEDIUM"
+        else:
+            qual = "CLEAN"
+        print(
+            f"[intercept-quality] mode={mode} tick={tick} missile={best_idx} "
+            f"dist={best_dist:.4f} radius={r:.4f} ratio={ratio:.3f} quality={qual}"
+        )
+
     def _move_pva_aircraft(self) -> None:
         s = self.state
         ac = s.aircraft
@@ -1020,17 +1091,63 @@ class App:
             ac.position.x + ac.direction.x * ac.speed * C.DT,
             ac.position.y + ac.direction.y * ac.speed * C.DT,
         )
+        prev = ac.position
+
+        # If the segment crosses the *visible* board border, decide outcome based on whether the
+        # crossing point lies on a locked (green) border segment.
+        visual_in_locked, visual_tile, _edge = segment_crosses_locked_exit_display(
+            s.grid,
+            prev,
+            next_pos,
+            frozenset(self.pva_locked_exit_tiles),
+        )
+        if visual_tile is not None:
+            locked_sorted = sorted(self.pva_locked_exit_tiles)
+            crossed_dbg = crossed_exit_tile(prev, next_pos, s.grid)
+            print(
+                f"[pva-exit-check] prev=({prev.x:.4f},{prev.y:.4f}) next=({next_pos.x:.4f},{next_pos.y:.4f}) "
+                f"visual_tile={visual_tile} crossed={crossed_dbg} locked={locked_sorted} "
+                f"visual_in_locked={visual_in_locked} "
+                f"result={'ESCAPED' if visual_in_locked else 'FAILED'}"
+            )
+            if visual_in_locked:
+                s.escaped = True
+                self.pva_phase = self.PVA_END
+                self.pva_result_text = "ESCAPED"
+                self.last_action = f"ESCAPED via {visual_tile}"
+                self._log_pva_result_once(
+                    result="ESCAPED",
+                    tick=int(s.tick),
+                    crossed=visual_tile,
+                    locked=locked_sorted,
+                    action=self.last_action,
+                )
+            else:
+                s.failed = True
+                self.pva_phase = self.PVA_END
+                self.pva_result_text = "ILLEGAL EXIT"
+                self.last_action = f"FAILED exit via {visual_tile}"
+                self._log_pva_result_once(
+                    result="FAILED_ILLEGAL_EXIT",
+                    tick=int(s.tick),
+                    crossed=visual_tile,
+                    locked=locked_sorted,
+                    action=self.last_action,
+                )
+            return
+
         if s.grid.in_bounds(next_pos):
             ac.position = next_pos
             return
-        prev = ac.position
+
+        # Fallback (should be rare): out-of-bounds without a visual border intersection.
         exit_tile = crossed_exit_tile(prev, next_pos, s.grid)
         locked_sorted = sorted(self.pva_locked_exit_tiles)
         in_locked = exit_tile is not None and exit_tile in self.pva_locked_exit_tiles
         esc = in_locked
         print(
             f"[pva-exit-check] prev=({prev.x:.4f},{prev.y:.4f}) next=({next_pos.x:.4f},{next_pos.y:.4f}) "
-            f"crossed={exit_tile} locked={locked_sorted} in_locked={in_locked} "
+            f"visual_tile=None crossed={exit_tile} locked={locked_sorted} in_locked={in_locked} "
             f"result={'ESCAPED' if esc else 'FAILED'}"
         )
         if esc:
@@ -1038,11 +1155,25 @@ class App:
             self.pva_phase = self.PVA_END
             self.pva_result_text = "ESCAPED"
             self.last_action = f"ESCAPED via {exit_tile}"
+            self._log_pva_result_once(
+                result="ESCAPED",
+                tick=int(s.tick),
+                crossed=exit_tile,
+                locked=locked_sorted,
+                action=self.last_action,
+            )
         else:
             s.failed = True
             self.pva_phase = self.PVA_END
             self.pva_result_text = "ILLEGAL EXIT"
             self.last_action = f"FAILED exit via {exit_tile}"
+            self._log_pva_result_once(
+                result="FAILED_ILLEGAL_EXIT",
+                tick=int(s.tick),
+                crossed=exit_tile,
+                locked=locked_sorted,
+                action=self.last_action,
+            )
 
     def _run_step_pva(self) -> None:
         t_step = time.perf_counter()
@@ -1058,9 +1189,15 @@ class App:
                 move_entity(missile, C.DT, s.grid, state=s)
             if check_interception(s.aircraft, s.missiles, s.grid):
                 s.intercepted = True
+                self._log_intercept_quality(tick=int(s.tick), mode="pva")
                 self.pva_phase = self.PVA_END
                 self.pva_result_text = "INTERCEPTED"
                 self.last_action = "INTERCEPTED"
+                self._log_pva_result_once(
+                    result="INTERCEPTED",
+                    tick=int(s.tick),
+                    action=self.last_action,
+                )
 
         if (
             self.pva_phase == self.PVA_RUNNING
