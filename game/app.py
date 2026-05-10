@@ -183,10 +183,9 @@ class App:
             return
 
         s = self.state
-        turn_max_remaining = max(0, C.TURN_WINDOW_MAX - s.tick)
-        if s.tick > C.TURN_WINDOW_MAX or turn_max_remaining <= 0:
-            self._predictor = ConstantVelocityPredictor()
-            return
+        # Player turn UI can remain available beyond TURN_WINDOW_MAX; keep the SAM predictor
+        # bounded by a reasonable horizon so branching cost doesn't explode.
+        turn_max_remaining = max(0, min(int(C.PLANNING_HORIZON), int(C.PLANNING_HORIZON)))
 
         spd = float(self.inferred_speed) if self.inferred_speed is not None else float(C.AIRCRAFT_SPEED)
 
@@ -348,13 +347,12 @@ class App:
         return f"({d.x:.2f},{d.y:.2f})"
 
     def _pva_in_turn_window(self) -> bool:
-        """Player may execute the one-turn only while tick is inside [TURN_WINDOW_MIN, TURN_WINDOW_MAX]."""
+        """Player may execute the one-turn while tick is >= TURN_WINDOW_MIN (one-turn-only still enforced)."""
         return (
             self.mode == self.MODE_PVA
             and self.pva_phase == self.PVA_RUNNING
             and int(C.TURN_WINDOW_MIN)
             <= self.state.tick
-            <= int(C.TURN_WINDOW_MAX)
         )
 
     def _recompute_pva_turn_fan(self) -> None:
@@ -377,7 +375,7 @@ class App:
                 self._pva_logged_outside_turn_fan = True
                 print(
                     f"[pva-turn] tick={self.state.tick} player_turn_dirs=0 sam_threat_turn_dirs=0 "
-                    f"window=[{C.TURN_WINDOW_MIN},{C.TURN_WINDOW_MAX}] heading=— hover=None "
+                    f"window=[{C.TURN_WINDOW_MIN},end] heading=— hover=None "
                     f"— outside_turn_window"
                 )
             return
@@ -414,7 +412,7 @@ class App:
             msg = (
                 f"[pva-turn] tick={self.state.tick} player_turn_dirs={len(self.pva_player_turn_dirs)} "
                 f"sam_threat_turn_dirs={len(self.pva_sam_threat_turn_dirs)} "
-                f"window=[{C.TURN_WINDOW_MIN},{C.TURN_WINDOW_MAX}] heading={hd} hover={hname}"
+                f"window=[{C.TURN_WINDOW_MIN},end] heading={hd} hover={hname}"
             )
             if len(self.pva_sam_threat_turn_dirs) == 0:
                 why = explain_legal_turn_empty(
@@ -425,7 +423,7 @@ class App:
                     self.pva_exit_stripe_half,
                     self.state.tick,
                     int(C.TURN_WINDOW_MIN),
-                    int(C.TURN_WINDOW_MAX),
+                    10**9,
                     self.pva_turn_used,
                 )
                 msg += f"  sam_threat_empty_why={why}"
@@ -464,7 +462,91 @@ class App:
         futures_list: list = []
         if isinstance(futures_raw, list):
             futures_list = futures_raw
-        self.ai_future_paths = futures_list[:5] if futures_list else []
+        # Display-only: select a small diverse subset of futures, keeping the primary future first.
+        def _future_sig(path: list[Vector2D]) -> tuple[tuple[int, int] | None, int, int]:
+            if path is None or len(path) < 2:
+                return (None, -1, 0)
+            p1 = path[-1]
+            p0 = path[-2]
+            dx = float(getattr(p1, "x", 0.0)) - float(getattr(p0, "x", 0.0))
+            dy = float(getattr(p1, "y", 0.0)) - float(getattr(p0, "y", 0.0))
+            d = nearest_direction(dx, dy) if (abs(dx) + abs(dy)) > 1e-9 else None
+            dir_bucket = int(d.index) if d is not None else -1
+            len_bucket = int(len(path) // 6)
+
+            g = self.state.grid
+            lx = float(getattr(p1, "x", 0.0))
+            ly = float(getattr(p1, "y", 0.0))
+            near_border = (
+                lx <= 0.05
+                or ly <= 0.05
+                or lx >= float(g.width - 1) - 0.05
+                or ly >= float(g.height - 1) - 0.05
+            )
+            exit_tile = None
+            if near_border:
+                last = Vector2D(lx, ly)
+                nxt = Vector2D(lx + dx, ly + dy)
+                if not g.in_bounds(nxt):
+                    exit_tile = crossed_exit_tile(last, nxt, g)
+            return (exit_tile, dir_bucket, len_bucket)
+
+        selected: list[list[Vector2D]] = []
+        if futures_list:
+            selected.append(futures_list[0])
+            seen = {_future_sig(futures_list[0])}
+            for p in futures_list[1:]:
+                if len(selected) >= 5:
+                    break
+                try:
+                    sig = _future_sig(p)
+                except Exception:
+                    sig = (None, -1, 0)
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                selected.append(p)
+            if len(selected) < 5:
+                for p in futures_list[1:]:
+                    if len(selected) >= 5:
+                        break
+                    if p in selected:
+                        continue
+                    selected.append(p)
+        self.ai_future_paths = selected
+
+        if self.mode == self.MODE_PVA and self.pva_phase == self.PVA_RUNNING and self.ai_future_paths:
+            g = self.state.grid
+            for i, path in enumerate(self.ai_future_paths):
+                if path is None or len(path) < 2:
+                    continue
+                p0 = path[0]
+                p1 = path[-1]
+                dx = float(getattr(p1, "x", 0.0)) - float(getattr(path[-2], "x", 0.0))
+                dy = float(getattr(p1, "y", 0.0)) - float(getattr(path[-2], "y", 0.0))
+                mag = math.hypot(dx, dy)
+                fx, fy = (dx / mag, dy / mag) if mag > 1e-9 else (0.0, 0.0)
+                lx = float(getattr(p1, "x", 0.0))
+                ly = float(getattr(p1, "y", 0.0))
+                near_border = (
+                    lx <= 0.05
+                    or ly <= 0.05
+                    or lx >= float(g.width - 1) - 0.05
+                    or ly >= float(g.height - 1) - 0.05
+                )
+                exit_tile = None
+                if near_border and mag > 1e-9:
+                    last = Vector2D(lx, ly)
+                    nxt = Vector2D(lx + dx, ly + dy)
+                    if not g.in_bounds(nxt):
+                        exit_tile = crossed_exit_tile(last, nxt, g)
+                print(
+                    f"[ai-future] i={i} len={len(path)} "
+                    f"first=({float(getattr(p0,'x',0.0)):.2f},{float(getattr(p0,'y',0.0)):.2f}) "
+                    f"last=({lx:.2f},{ly:.2f}) "
+                    f"final_dir=({fx:.2f},{fy:.2f}) "
+                    f"near_border={near_border} exit_tile={exit_tile}"
+                )
 
         pred_name = getattr(diag, "predictor_name", None)
         pred_name_str = pred_name if isinstance(pred_name, str) and pred_name else "?"
@@ -610,7 +692,7 @@ class App:
                 return True
         return False
 
-    def _replan(self) -> TruckPlan | None:
+    def _replan(self, *, validate_diag: bool = True) -> TruckPlan | None:
         s = self.state
         truck = s.sam_truck
         t0 = time.perf_counter()
@@ -651,7 +733,7 @@ class App:
         vok: bool | None = None
         if self.mode == self.MODE_PVA and self.pva_phase == self.PVA_RUNNING:
             sp = self.inferred_speed if self.inferred_speed is not None else float(C.AIRCRAFT_SPEED)
-            if best is not None and self.inferred_direction is not None:
+            if validate_diag and best is not None and self.inferred_direction is not None:
                 vok = validate_plan(
                     best,
                     truck,
@@ -665,6 +747,8 @@ class App:
                     self._predictor,
                     missile_verify_cap=C.MISSILE_MAX_STEPS,
                 )
+            elif not validate_diag:
+                vok = None
 
         self._build_ai_inspector(best, diag)
 
@@ -687,7 +771,7 @@ class App:
                 f"futures={diag.futures_evaluated}  {cov_h}"
                 f"planner_ms={self.last_planner_ms:.1f}  "
                 f"confidence={self.ai_confidence_label}  "
-                f"validate_plan_ok={vok}  "
+                f"validate_plan_ok={'skipped' if not validate_diag else vok}  "
                 f"no_sol={diag.no_solution_reason or '—'}"
             )
 
@@ -712,7 +796,32 @@ class App:
             self.ai_plan_summary = "AI LOW | Waiting for radar lock"
             return None
 
-        if self._plan_is_stale():
+        # Experiment (PVA only): before firing, replan every tick for maximum reactivity.
+        # Automatic mode retains the existing reuse interval.
+        if self.mode == self.MODE_PVA and self.pva_phase == self.PVA_RUNNING and not truck.has_fired:
+            print("[pva-replan] reason=every_tick_before_fire")
+            # Reduce overhead: skip expensive validate_plan() diagnostic most ticks during forced replans.
+            do_validate = (int(s.tick) % 5) == 0
+            new_plan = self._replan(validate_diag=do_validate)
+            if new_plan is not None:
+                self.active_plan = new_plan
+            elif self.active_plan is not None:
+                ap = self.active_plan
+                # Only keep old plans that still have staging steps; never keep an immediate-fire plan.
+                if int(ap.move_steps) > 0 or int(ap.wait_steps) > 0:
+                    md = self._direction_name(ap.move_direction) if ap.move_direction else "NONE"
+                    fd = self._direction_name(ap.fire_direction)
+                    print(
+                        f"[pva-plan-keep] reason=replan_none keeping={ap.plan_type} "
+                        f"move={md}x{ap.move_steps} wait={ap.wait_steps} fire={fd} fire_tick={ap.fire_tick}"
+                    )
+                else:
+                    print(
+                        f"[pva-plan-drop] reason=replan_none_old_plan_immediate_fire old={ap.plan_type} "
+                        f"fire_tick={ap.fire_tick} intercept_tick={ap.intercept_tick}"
+                    )
+                    self.active_plan = None
+        elif self._plan_is_stale():
             self.active_plan = self._replan()
         else:
             self._ticks_since_replan += 1
@@ -984,7 +1093,7 @@ class App:
                 f"[pva-turn] deployed tick={self.state.tick} "
                 f"player_turn_dirs={len(self.pva_player_turn_dirs)} "
                 f"sam_threat_turn_dirs={len(self.pva_sam_threat_turn_dirs)} "
-                f"window=[{C.TURN_WINDOW_MIN},{C.TURN_WINDOW_MAX}] "
+                f"window=[{C.TURN_WINDOW_MIN},end] "
                 f"hover={self._direction_name(self.pva_turn_hover_direction)}"
             )
             self.last_action = "Aircraft deployed"
