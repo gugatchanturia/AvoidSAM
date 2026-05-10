@@ -1,0 +1,8 @@
+
+# Runtime/generated files
+logs/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/

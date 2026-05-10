@@ -98,7 +98,7 @@ class App:
         self._dbg_turn_fan_key: object | None = None
         self._pva_logged_outside_turn_fan: bool = False
         self._pva_turn_ptr: tuple[float, float] = (1.0, 0.0)
-        self._pva_last_sam_turn_dirs_count: int = 0
+        self._pva_last_predictor_candidate_dirs: int = 0
         self.pva_turn_used: bool = False
         self.pva_turn_hover_direction: DirectionVector | None = None
         self.pva_result_text: str = ""
@@ -192,6 +192,8 @@ class App:
         pos_v = Vector2D(ac.position.x, ac.position.y)
         plan_heading = self.inferred_direction if self.inferred_direction is not None else ac.direction
 
+        turn_min_remaining = max(0, C.TURN_WINDOW_MIN - s.tick)
+
         if C.PVA_SAM_CONSIDER_ONLY_WINNING_TURNS:
             dirs = predictor_post_turn_candidates(
                 grid=s.grid,
@@ -204,11 +206,14 @@ class App:
                 max_total=18,
                 lookahead_steps=32,
                 exit_stripe_half=self.pva_exit_stripe_half,
+                turn_min_remaining=turn_min_remaining,
+                turn_max_remaining=turn_max_remaining,
             )
         else:
             dirs = list(DIRECTIONS)
-        self._pva_last_sam_turn_dirs_count = len(dirs)
-        turn_min_remaining = max(0, C.TURN_WINDOW_MIN - s.tick)
+            ESCAPE_DEBUG_LAST["predictor_late_turn_dirs"] = 0
+            ESCAPE_DEBUG_LAST["predictor_late_turn_prefix_ticks"] = 0
+        self._pva_last_predictor_candidate_dirs = len(dirs)
 
         self._predictor = TurnAwarePredictor(
             turn_min_remaining=turn_min_remaining,
@@ -260,7 +265,7 @@ class App:
         self._dbg_turn_fan_key = None
         self._pva_logged_outside_turn_fan = False
         self._pva_turn_ptr = (1.0, 0.0)
-        self._pva_last_sam_turn_dirs_count = 0
+        self._pva_last_predictor_candidate_dirs = 0
         self.pva_turn_used = False
         self.pva_turn_hover_direction = None
         self.pva_result_text = ""
@@ -480,7 +485,9 @@ class App:
         primary_hit = bool(getattr(best, "primary_hit", False))
         if primary_hit and cov >= 0.75:
             confidence = "HIGH"
-        elif primary_hit or cov >= 0.50:
+        elif primary_hit and cov >= 0.35:
+            confidence = "MEDIUM"
+        elif cov >= 0.50:
             confidence = "MEDIUM"
         else:
             confidence = "LOW"
@@ -527,7 +534,8 @@ class App:
         print(
             "[ai-explain] "
             f"confidence={confidence} predictor={pred_name_str} plan={plan_type_s} "
-            f"coverage={fh}/{max(ft, 1)} primary_hit={ph} text=\"{tex}\""
+            f"coverage={fh}/{max(ft, 1)} coverage_pct={cov:.3f} primary_hit={ph} "
+            f"planner_ms={self.last_planner_ms:.1f} text=\"{tex}\""
         )
 
     def _fmt_plan(self, label: str, plan: TruckPlan | None) -> str:
@@ -620,9 +628,9 @@ class App:
             f"verified={diag.directions_verified}  "
             f"fallback={diag.fallback_used}  planner={self.last_planner_ms:.1f}ms"
         )
+        vok: bool | None = None
         if self.mode == self.MODE_PVA and self.pva_phase == self.PVA_RUNNING:
             sp = self.inferred_speed if self.inferred_speed is not None else float(C.AIRCRAFT_SPEED)
-            vok = None
             if best is not None and self.inferred_direction is not None:
                 vok = validate_plan(
                     best,
@@ -637,14 +645,32 @@ class App:
                     self._predictor,
                     missile_verify_cap=C.MISSILE_MAX_STEPS,
                 )
+
+        self._build_ai_inspector(best, diag)
+
+        if self.mode == self.MODE_PVA and self.pva_phase == self.PVA_RUNNING:
+            cov_h = ""
+            if best is not None:
+                bft = max(int(getattr(best, "futures_total", 0)), 1)
+                bfh = int(getattr(best, "futures_hit", 0))
+                cov_pct = bfh / bft
+                cov_h = f"coverage={bfh}/{bft} coverage_pct={cov_pct:.3f}  "
+            else:
+                cov_h = "coverage=— coverage_pct=n/a  "
+            ltd = ESCAPE_DEBUG_LAST.get("predictor_late_turn_dirs")
+            late_turn_n = int(ltd) if isinstance(ltd, (int, float)) else 0
             print(
                 f"  [pva-planner] predictor={diag.predictor_name}  "
-                f"sam_threat_turn_dirs={self._pva_last_sam_turn_dirs_count}  "
-                f"futures={diag.futures_evaluated}  validate_plan_ok={vok}  "
+                f"predictor_candidate_dirs={self._pva_last_predictor_candidate_dirs}  "
+                f"strict_turn_dirs={len(self.pva_sam_threat_turn_dirs)}  "
+                f"late_turn_dirs={late_turn_n}  "
+                f"futures={diag.futures_evaluated}  {cov_h}"
+                f"planner_ms={self.last_planner_ms:.1f}  "
+                f"confidence={self.ai_confidence_label}  "
+                f"validate_plan_ok={vok}  "
                 f"no_sol={diag.no_solution_reason or '—'}"
             )
 
-        self._build_ai_inspector(best, diag)
         return best
 
     def _apply_truck_action(self) -> TruckPlan | None:
@@ -823,11 +849,23 @@ class App:
             base_deg = math.degrees(float(base_rad)) if isinstance(base_rad, (int, float)) else None
             ch = ESCAPE_DEBUG_LAST.get("pva_launch_half_cone_deg")
             ex = ESCAPE_DEBUG_LAST.get("pva_launch_cone_expand_extra_deg")
+            raw_n = ESCAPE_DEBUG_LAST.get("pva_launch_raw_count")
+            raw_n_disp = (
+                int(raw_n) if isinstance(raw_n, (int, float)) else len(self.pva_valid_launch_dirs)
+            )
+            rj_s = ESCAPE_DEBUG_LAST.get("pva_launch_rejected_short")
+            rj_a = ESCAPE_DEBUG_LAST.get("pva_launch_rejected_adjacent_short")
+            rj_ne = ESCAPE_DEBUG_LAST.get("pva_launch_rejected_no_exit")
+            rs = int(rj_s) if isinstance(rj_s, (int, float)) else 0
+            ra = int(rj_a) if isinstance(rj_a, (int, float)) else 0
+            rn = int(rj_ne) if isinstance(rj_ne, (int, float)) else 0
             ang_list = [round(math.degrees(math.atan2(d.y, d.x)), 1) for d in self.pva_valid_launch_dirs]
             print(
                 f"[pva-launch] tile={self.pva_locked_tile}  sam=({sam_p.x:.2f},{sam_p.y:.2f})  "
                 f"base_deg={base_deg}  cone_half_deg={ch}  cone_expand_extra_deg={ex}  "
-                f"n_dirs={len(self.pva_valid_launch_dirs)}  angles_deg={ang_list}"
+                f"raw_dirs={raw_n_disp}  valid_dirs={len(self.pva_valid_launch_dirs)}  "
+                f"rejected_short={rs}  rejected_adjacent_short={ra}  rejected_no_exit={rn}  "
+                f"angles_deg={ang_list}"
             )
             self.pva_hover_direction = self.pva_valid_launch_dirs[0] if self.pva_valid_launch_dirs else None
             self.pva_hover_exit_tiles = (
@@ -855,6 +893,17 @@ class App:
                 speed=float(C.AIRCRAFT_SPEED),
                 dt=float(C.DT),
             )
+            if len(self.pva_locked_exit_tiles) == 0:
+                dn = self._direction_name(self.pva_locked_direction)
+                print(
+                    f"[pva-heading-reject] tile={self.pva_locked_tile} dir={dn} "
+                    "reason=no_valid_exit_tiles"
+                )
+                self.pva_locked_direction = None
+                self.pva_locked_exit_tiles = set()
+                self.last_action = "Invalid heading: no valid exit corridor"
+                return
+
             self.pva_exit_stripe_half = exit_stripe_half_for_pva()
             first_hit = ESCAPE_DEBUG_LAST.get("first_hit_debug", "?")
             print(
@@ -870,6 +919,31 @@ class App:
         if self.pva_phase == self.PVA_CONFIRM:
             if self.pva_locked_tile is None or self.pva_locked_direction is None:
                 return
+            if len(self.pva_locked_exit_tiles) == 0:
+                self.pva_locked_exit_tiles = project_valid_exit_tiles(
+                    self.state.grid,
+                    self.pva_locked_tile,
+                    self.pva_locked_direction,
+                    speed=float(C.AIRCRAFT_SPEED),
+                    dt=float(C.DT),
+                )
+            if len(self.pva_locked_exit_tiles) == 0:
+                dn = self._direction_name(self.pva_locked_direction)
+                print(
+                    f"[pva-heading-reject] tile={self.pva_locked_tile} dir={dn} "
+                    "reason=no_valid_exit_tiles"
+                )
+                self.pva_phase = self.PVA_ANGLE_SELECT
+                self.pva_locked_direction = None
+                self.pva_locked_exit_tiles = set()
+                self.pva_exit_stripe_half = 0
+                self.pva_player_turn_dirs = []
+                self.pva_sam_threat_turn_dirs = []
+                self._dbg_turn_fan_key = None
+                self._pva_logged_outside_turn_fan = False
+                self.last_action = "Invalid heading: no valid exit corridor"
+                return
+
             self.state.aircraft.position = tile_pos(self.pva_locked_tile)
             self.state.aircraft.direction = self.pva_locked_direction
             self.state.aircraft.speed = C.AIRCRAFT_SPEED
@@ -949,8 +1023,17 @@ class App:
         if s.grid.in_bounds(next_pos):
             ac.position = next_pos
             return
-        exit_tile = crossed_exit_tile(ac.position, next_pos, s.grid)
-        if exit_tile is not None and exit_tile in self.pva_locked_exit_tiles:
+        prev = ac.position
+        exit_tile = crossed_exit_tile(prev, next_pos, s.grid)
+        locked_sorted = sorted(self.pva_locked_exit_tiles)
+        in_locked = exit_tile is not None and exit_tile in self.pva_locked_exit_tiles
+        esc = in_locked
+        print(
+            f"[pva-exit-check] prev=({prev.x:.4f},{prev.y:.4f}) next=({next_pos.x:.4f},{next_pos.y:.4f}) "
+            f"crossed={exit_tile} locked={locked_sorted} in_locked={in_locked} "
+            f"result={'ESCAPED' if esc else 'FAILED'}"
+        )
+        if esc:
             s.escaped = True
             self.pva_phase = self.PVA_END
             self.pva_result_text = "ESCAPED"

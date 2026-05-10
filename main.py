@@ -195,22 +195,56 @@ def draw_direction_fan(screen, origin_tile: tuple[int, int], directions: list[Di
 def draw_preview_path(screen, grid, origin_tile: tuple[int, int], direction: DirectionVector | None, color) -> None:
     if origin_tile is None or direction is None:
         return
-    start = Vector2D(float(origin_tile[0]), float(origin_tile[1]))
-    pos = Vector2D(start.x, start.y)
-    pts = [(pos.x * CELL_SIZE + CELL_SIZE / 2, pos.y * CELL_SIZE + CELL_SIZE / 2)]
-    for _ in range(200):
-        next_pos = Vector2D(pos.x + direction.x * 0.25, pos.y + direction.y * 0.25)
-        if not grid.in_bounds(next_pos):
-            break
-        pos = next_pos
-        pts.append((pos.x * CELL_SIZE + CELL_SIZE / 2, pos.y * CELL_SIZE + CELL_SIZE / 2))
-    if len(pts) >= 2:
-        overlay = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
-        pygame.draw.lines(overlay, (*color, 140), False, pts, 3)
-        screen.blit(overlay, (0, 0))
+    # Display-only: draw ray from tile center and clip to grid pixel rect.
+    x1 = float(origin_tile[0]) * CELL_SIZE + CELL_SIZE / 2
+    y1 = float(origin_tile[1]) * CELL_SIZE + CELL_SIZE / 2
+    # Large enough to reach any border after clipping.
+    ray_len = float(max(grid.width, grid.height) * CELL_SIZE * 4)
+    x2 = x1 + float(direction.x) * ray_len
+    y2 = y1 + float(direction.y) * ray_len
+    grid_rect = pygame.Rect(0, 0, int(grid.width * CELL_SIZE), int(grid.height * CELL_SIZE))
+    clipped = grid_rect.clipline((x1, y1), (x2, y2))
+    if not clipped:
+        return
+    (cx1, cy1), (cx2, cy2) = clipped
+    overlay = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
+    pygame.draw.line(overlay, (*color, 140), (float(cx1), float(cy1)), (float(cx2), float(cy2)), 3)
+    screen.blit(overlay, (0, 0))
 
 
-def draw_future_paths(screen, paths) -> None:
+def _ray_box_positive_exit_length(
+    px: float,
+    py: float,
+    ux: float,
+    uy: float,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+) -> float | None:
+    """Smallest ``t`` > 0 so ``(px + t*ux, py + t*uy)`` lies on ``[x0,x1]×[y0,y1]`` boundary."""
+    eps = 1e-9
+    ts: list[float] = []
+    if abs(ux) > eps:
+        for xv in (x0, x1):
+            t = (xv - px) / ux
+            if t <= eps:
+                continue
+            yy = py + uy * t
+            if y0 - 1e-3 <= yy <= y1 + 1e-3:
+                ts.append(t)
+    if abs(uy) > eps:
+        for yv in (y0, y1):
+            t = (yv - py) / uy
+            if t <= eps:
+                continue
+            xx = px + ux * t
+            if x0 - 1e-3 <= xx <= x1 + 1e-3:
+                ts.append(t)
+    return min(ts) if ts else None
+
+
+def draw_future_paths(screen, paths, grid=None) -> None:
     if paths is None:
         return
     if len(paths) == 0:
@@ -220,6 +254,15 @@ def draw_future_paths(screen, paths) -> None:
         overlay = pygame.Surface((ww, hh), pygame.SRCALPHA)
     except Exception:
         return
+
+    gw_p = ww
+    gh_p = hh
+    if grid is not None:
+        try:
+            gw_p = float(grid.width) * CELL_SIZE
+            gh_p = float(grid.height) * CELL_SIZE
+        except Exception:
+            pass
 
     muted = (
         (100, 150, 220, 50),
@@ -254,6 +297,30 @@ def draw_future_paths(screen, paths) -> None:
             pygame.draw.lines(overlay, col, False, pts, 2)
         except Exception:
             pass
+
+        xa, ya = pts[-2]
+        xb, yb = pts[-1]
+        dx = xb - xa
+        dy = yb - ya
+        ln = math.hypot(dx, dy)
+        if ln >= 1e-6:
+            uxu, uyu = dx / ln, dy / ln
+            t_candidates: list[float] = []
+            t_g = _ray_box_positive_exit_length(xb, yb, uxu, uyu, 0.0, 0.0, gw_p, gh_p)
+            t_s = _ray_box_positive_exit_length(xb, yb, uxu, uyu, 0.0, 0.0, float(ww), float(hh))
+            if t_g is not None:
+                t_candidates.append(t_g)
+            if t_s is not None:
+                t_candidates.append(t_s)
+            if t_candidates:
+                t_ext = min(t_candidates)
+                x2 = xb + uxu * t_ext
+                y2 = yb + uyu * t_ext
+                faint = (col[0], col[1], col[2], max(10, min(80, col[3] // 3)))
+                try:
+                    pygame.draw.line(overlay, faint, (xb, yb), (x2, y2), 1)
+                except Exception:
+                    pass
 
     try:
         screen.blit(overlay, (0, 0))
@@ -621,7 +688,7 @@ def _run_app() -> None:
 
         if app.mode == App.MODE_PVA and app.pva_phase == App.PVA_RUNNING:
             fps = getattr(app, "ai_future_paths", [])
-            draw_future_paths(screen, fps)
+            draw_future_paths(screen, fps, app.state.grid)
 
         if app.mode != App.MODE_MENU:
             truck = app.state.sam_truck
