@@ -157,12 +157,11 @@ Older 3.x versions may work but are **not** the documented test matrix.
 - The **north star is explainable tactical AI**, not a **solved, perfect adversary**.
 
 ---
-
-## Demo
+# Demo
 
 A short gameplay or replay clip belongs here:
 
-[Demo video placeholder](PASTE_VIDEO_LINK_HERE)
+[Demo video](docs/screenshots/demo.mp4)
 
 ---
 
