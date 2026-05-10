@@ -79,6 +79,9 @@ class App:
         self.last_step_ms: float = 0.0
         self.last_diag: PlannerDiagnostic = PlannerDiagnostic()
         self._predictor = ConstantVelocityPredictor()
+        # PVA diagnostics: last validate_plan() result for the last planner output.
+        # None means "skipped/not run".
+        self._pva_last_validate_plan_ok: bool | None = None
 
         self.state: GameState = self._build_auto_state(self.scenarios[0])
 
@@ -628,11 +631,17 @@ class App:
             dn = self._plan_display_name(plan_type_s)
             expl = f"{dn}; {primary_seg}; covers {fh}/{max(ft, 1)} futures."
 
+        if confidence == "LOW" and (int(getattr(best, "move_steps", 0)) > 0 or int(getattr(best, "wait_steps", 0)) > 0):
+            expl = f"Weak staging (best available): {expl}"
+
         self.ai_explanation = expl
 
         tier = "HIGH" if confidence == "HIGH" else ("MED" if confidence == "MEDIUM" else "LOW")
         pdn = self._plan_display_name(plan_type_s)
-        self.ai_plan_summary = f"AI {tier} | {pred_name_str} | {pdn} | covers {fh}/{max(ft, 1)}"
+        if confidence == "LOW" and (int(getattr(best, "move_steps", 0)) > 0 or int(getattr(best, "wait_steps", 0)) > 0):
+            self.ai_plan_summary = f"AI {tier} | {pred_name_str} | weak staging | {pdn} | covers {fh}/{max(ft, 1)}"
+        else:
+            self.ai_plan_summary = f"AI {tier} | {pred_name_str} | {pdn} | covers {fh}/{max(ft, 1)}"
 
         tex = expl.replace('"', "'")
         ph = str(primary_hit).lower()
@@ -752,6 +761,8 @@ class App:
                 )
             elif not validate_diag:
                 vok = None
+        if self.mode == self.MODE_PVA and self.pva_phase == self.PVA_RUNNING:
+            self._pva_last_validate_plan_ok = vok
 
         self._build_ai_inspector(best, diag)
 
@@ -785,6 +796,29 @@ class App:
         truck = s.sam_truck
         best: TruckPlan | None = None
 
+        def _pva_action_explain(
+            *,
+            policy: str,
+            plan: TruckPlan | None,
+            reason: str,
+        ) -> None:
+            if not (self.mode == self.MODE_PVA and self.pva_phase == self.PVA_RUNNING):
+                return
+            fh = int(getattr(plan, "futures_hit", 0)) if plan is not None else 0
+            ft_raw = int(getattr(plan, "futures_total", 0)) if plan is not None else 0
+            ft = max(ft_raw, 1) if plan is not None else 0
+            confidence = str(self.ai_confidence_label or "")
+            vok = self._pva_last_validate_plan_ok
+            validate_s = "skipped" if vok is None else ("true" if bool(vok) else "false")
+            tag = " tag=RISKY_UNVALIDATED" if vok is False else ""
+            cov_s = "—" if plan is None else f"{fh}/{ft}"
+            safe_reason = reason.replace('"', "'")
+            print(
+                "[pva-action-explain] "
+                f"policy={policy}{tag} confidence={confidence} coverage={cov_s} validate={validate_s} "
+                f"reason=\"{safe_reason}\""
+            )
+
         self._refresh_predictor()
 
         if truck.has_fired:
@@ -811,6 +845,11 @@ class App:
                 and float(self.last_planner_ms) > 180.0
                 and bool(self._pva_heavy_skip_armed)
             ):
+                _pva_action_explain(
+                    policy="HEAVY_REUSE",
+                    plan=ap0,
+                    reason="Reusing one staging step after an expensive planner tick to avoid lag.",
+                )
                 self._pva_heavy_skip_armed = False
                 md0 = self._direction_name(ap0.move_direction) if ap0.move_direction else "NONE"
                 print(
@@ -844,6 +883,11 @@ class App:
                         self.active_plan = None
             # If we still have no plan (or just dropped an unsafe immediate-fire plan), hold.
             if self.active_plan is None:
+                _pva_action_explain(
+                    policy="NO_PLAN_HOLD",
+                    plan=None,
+                    reason="No verified plan; refuses fake chase movement.",
+                )
                 self.last_action = "idle (no verified plan)"
                 print("[pva-no-plan-hold] reason=no_verified_plan no_chase=True")
                 return None
@@ -864,6 +908,14 @@ class App:
             return None
 
         if best.move_steps > 0:
+            policy = "VERIFIED_PLAN"
+            if self.ai_confidence_label == "LOW":
+                policy = "WEAK_STAGING"
+            _pva_action_explain(
+                policy=policy,
+                plan=best,
+                reason="Executing planner plan: staging move step.",
+            )
             truck.direction = best.move_direction
             move_entity(truck, C.DT, s.grid, state=s)
             self.last_action = f"move {self._direction_name(best.move_direction)}"
@@ -873,6 +925,14 @@ class App:
             )
             print(f"  ACTION: move  ({best.move_steps} steps left)")
         elif best.wait_steps > 0:
+            policy = "VERIFIED_PLAN"
+            if self.ai_confidence_label == "LOW":
+                policy = "WEAK_STAGING"
+            _pva_action_explain(
+                policy=policy,
+                plan=best,
+                reason="Executing planner plan: staging wait step.",
+            )
             self.last_action = "wait"
             self.active_plan = replace(
                 self._advance_plan_tick_fields(best),
@@ -895,6 +955,11 @@ class App:
                 cov = (fh / ft) if ft > 0 else 0.0
                 confidence = str(self.ai_confidence_label or "")
                 if (confidence == "LOW") and (cov < 0.50):
+                    _pva_action_explain(
+                        policy="WEAK_FIRE_HELD",
+                        plan=best,
+                        reason="Refused a bad shot: LOW confidence and coverage below 0.50.",
+                    )
                     self.last_action = "hold fire (weak plan)"
                     print(
                         "[pva-fire-hold] "
@@ -904,6 +969,12 @@ class App:
                     self.active_plan = None
                     return None
 
+            # Allowed to fire.
+            _pva_action_explain(
+                policy="VERIFIED_PLAN" if self.ai_confidence_label in ("HIGH", "MEDIUM") else "WEAK_STAGING",
+                plan=best,
+                reason="Executing planner plan: firing step.",
+            )
             missile = launch_missile_in_direction(truck, C.MISSILE_SPEED, best.fire_direction)
             if missile is not None:
                 s.missiles.append(missile)
