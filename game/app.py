@@ -799,6 +799,21 @@ class App:
         # Experiment (PVA only): before firing, replan every tick for maximum reactivity.
         # Automatic mode retains the existing reuse interval.
         if self.mode == self.MODE_PVA and self.pva_phase == self.PVA_RUNNING and not truck.has_fired:
+            # Smoothness: if the previous replan was heavy and we already have a staging plan
+            # (move/wait only), reuse it for one tick instead of replanning again immediately.
+            ap0 = self.active_plan
+            if (
+                ap0 is not None
+                and (int(ap0.move_steps) > 0 or int(ap0.wait_steps) > 0)
+                and float(self.last_planner_ms) > 180.0
+            ):
+                md0 = self._direction_name(ap0.move_direction) if ap0.move_direction else "NONE"
+                print(
+                    "[pva-replan-skip] reason=heavy_previous_keep_staging "
+                    f"planner_ms={self.last_planner_ms:.1f} plan={ap0.plan_type} "
+                    f"move={md0}x{ap0.move_steps} wait={ap0.wait_steps}"
+                )
+            else:
             print("[pva-replan] reason=every_tick_before_fire")
             # Reduce overhead: skip expensive validate_plan() diagnostic most ticks during forced replans.
             do_validate = (int(s.tick) % 5) == 0
@@ -821,6 +836,20 @@ class App:
                         f"fire_tick={ap.fire_tick} intercept_tick={ap.intercept_tick}"
                     )
                     self.active_plan = None
+            # If we still have no plan (or just dropped an unsafe immediate-fire plan), do a cheap
+            # one-step staging move toward the aircraft instead of freezing.
+            if self.active_plan is None:
+                dx = float(s.aircraft.position.x - truck.position.x)
+                dy = float(s.aircraft.position.y - truck.position.y)
+                stage_dir = nearest_direction(dx, dy)
+                truck.direction = stage_dir
+                move_entity(truck, C.DT, s.grid, state=s)
+                self.last_action = "fallback stage"
+                print(
+                    f"[pva-staging-fallback] reason=no_verified_plan dir={self._direction_name(stage_dir)} "
+                    "no_fire=True"
+                )
+                return None
         elif self._plan_is_stale():
             self.active_plan = self._replan()
         else:
@@ -854,6 +883,37 @@ class App:
             )
             print(f"  ACTION: wait  ({best.wait_steps} steps left)")
         else:
+            # PVA policy: before the player uses their one turn, guard against obviously weak
+            # immediate-fire plans. Movement/wait plans are always allowed.
+            if (
+                self.mode == self.MODE_PVA
+                and self.pva_phase == self.PVA_RUNNING
+                and (not truck.has_fired)
+                and (not self.pva_turn_used)
+                and int(best.move_steps) <= 0
+                and int(best.wait_steps) <= 0
+            ):
+                fh = int(getattr(best, "futures_hit", 0))
+                ft = int(getattr(best, "futures_total", 0))
+                cov = (fh / ft) if ft > 0 else 0.0
+                primary_hit = bool(getattr(best, "primary_hit", False))
+                confidence = str(self.ai_confidence_label or "")
+                weak = (
+                    (not primary_hit)
+                    or (ft > 1 and cov < 0.50)
+                    or (confidence == "LOW")
+                )
+                if weak:
+                    self.last_action = "hold fire (weak plan)"
+                    print(
+                        "[pva-fire-hold] "
+                        f"reason=weak_plan primary_hit={str(primary_hit).lower()} "
+                        f"coverage={fh}/{max(ft,1)} coverage_pct={cov:.3f} "
+                        f"confidence={confidence} plan={best.plan_type}"
+                    )
+                    self.active_plan = None
+                    return None
+
             missile = launch_missile_in_direction(truck, C.MISSILE_SPEED, best.fire_direction)
             if missile is not None:
                 s.missiles.append(missile)
