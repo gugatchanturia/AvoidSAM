@@ -1022,13 +1022,404 @@ def _replay_preflight_line(tag: str) -> str:
     }.get(tag, "prep")
 
 
+def _replay_phase_badge(fr: PVAReplayFrame) -> str:
+    """
+    Replay-only phase badge for the decision dashboard.
+    Must not affect gameplay logic; derived purely from snapshot fields.
+    """
+    if _replay_terminal(fr):
+        return "RESULT"
+    if (fr.action_policy or "").strip().upper() == "WAITING_RADAR":
+        return "SENSOR LOCK"
+
+    # Strict "fire decision": only on an actual launch tick, as recorded in snapshot fields.
+    try:
+        if int(getattr(fr, "launch_tick", -1)) >= 0 and int(fr.tick) == int(fr.launch_tick):
+            return "FIRE DECISION"
+    except Exception:
+        pass
+    la_u = (getattr(fr, "last_action", "") or "").strip().upper()
+    if "FIRED" in la_u:
+        return "FIRE DECISION"
+
+    # Tracking only if a missile was actually launched earlier in the round (as per snapshot fields).
+    fired_context = False
+    try:
+        fired_context = bool(getattr(fr, "truck_has_fired", False)) or (int(getattr(fr, "launch_tick", -1)) >= 0)
+    except Exception:
+        fired_context = bool(getattr(fr, "truck_has_fired", False))
+    if fired_context or (_replay_active_missile_count(fr) > 0):
+        return "MISSILE TRACKING"
+    return "PLANNING"
+
+
+def _replay_active_missile_count(fr: PVAReplayFrame) -> int:
+    try:
+        return sum(1 for m in (fr.missiles or []) if m and len(m) >= 4 and bool(m[3]))
+    except Exception:
+        return 0
+
+
+def _replay_frame_is_actual_fire(frames: list[PVAReplayFrame], idx: int) -> bool:
+    """
+    Strict replay truth: FIRE only when a missile was actually launched on this tick.
+    Evidence (any):
+    - launch_tick == tick (if recorded), OR
+    - last_action contains an actual fired marker, OR
+    - active missile count transitions 0 -> >0 vs previous frame.
+    """
+    if not frames or idx < 0 or idx >= len(frames):
+        return False
+    fr = frames[idx]
+    try:
+        if int(getattr(fr, "launch_tick", -1)) >= 0 and int(fr.tick) == int(fr.launch_tick):
+            return True
+    except Exception:
+        pass
+    la_u = (getattr(fr, "last_action", "") or "").strip().upper()
+    if "FIRED" in la_u:
+        return True
+    cur = _replay_active_missile_count(fr)
+    prev = _replay_active_missile_count(frames[idx - 1]) if idx - 1 >= 0 else 0
+    return prev == 0 and cur > 0
+
+
+def _replay_any_missile_launched(frames: list[PVAReplayFrame]) -> bool:
+    if not frames:
+        return False
+    for i in range(len(frames)):
+        if _replay_frame_is_actual_fire(frames, i):
+            return True
+    return False
+
+
+def _replay_frame_is_tracking(frames: list[PVAReplayFrame], idx: int) -> bool:
+    """
+    Missile tracking starts only after an actual launch on a previous tick.
+    """
+    if not frames or idx < 0 or idx >= len(frames):
+        return False
+    if _replay_terminal(frames[idx]):
+        return False
+    if _replay_frame_is_actual_fire(frames, idx):
+        return False
+    if idx <= 0:
+        return False
+    return any(_replay_frame_is_actual_fire(frames, j) for j in range(0, idx))
+
+
+def _replay_selected_action(fr: PVAReplayFrame, group_rep: PVAReplayFrame) -> str:
+    """
+    Map replay snapshot text/policy into one of:
+    FIRE / WAIT / MOVE / HOLD / OBSERVE
+    """
+    la = (group_rep.last_action or "").lower()
+    pol = (group_rep.action_policy or "").strip().upper()
+    ps = (group_rep.ai_plan_summary or "").lower()
+
+    # FIRE must be strict: only when an actual launch happened on this tick.
+    # (Handled by caller using _replay_frame_is_actual_fire; keep this function non-fire by default.)
+    if _replay_terminal(fr):
+        return "OBSERVE"
+    if pol == "WAITING_RADAR" or any(k in la for k in ("wait", "sensor lock", "verified wait", "dwell", "idle")) or (
+        "wait" in ps
+    ):
+        return "WAIT"
+    if any(k in la for k in ("move", "reposition", "staging", "stage", "truck")) or pol in ("WEAK_STAGING", "HEAVY_REUSE"):
+        return "MOVE"
+    if pol in ("NO_PLAN_HOLD", "WEAK_FIRE_HELD") or any(k in la for k in ("hold", "no plan")):
+        return "HOLD"
+    return "HOLD"
+
+
+def _parse_ratio_from_text(s: str) -> tuple[int | None, int | None]:
+    t = (s or "").strip()
+    if not t or "/" not in t:
+        return (None, None)
+    a, b = t.split("/", 1)
+    try:
+        na = int(a.strip())
+        nb = int(b.strip())
+        if nb <= 0:
+            return (None, None)
+        na = max(0, min(na, nb))
+        return (na, nb)
+    except Exception:
+        return (None, None)
+
+
+def _replay_confidence_pack(view_fr: PVAReplayFrame, group_rep: PVAReplayFrame) -> tuple[str, float | None, str]:
+    """
+    Returns (bucket, ratio_0_to_1_or_None, coverage_text_short).
+    Uses launch coverage when missile already launched to avoid misleading 0/1 after launch.
+    """
+    phase = _replay_phase_badge(view_fr)
+
+    # Prefer launch snapshot if tracking or result, and if launch coverage exists.
+    cov_src = ""
+    lbl_src = ""
+    if phase in ("MISSILE TRACKING", "RESULT"):
+        cov_src = (view_fr.launch_coverage or group_rep.launch_coverage or "").strip()
+        lbl_src = (view_fr.launch_confidence or group_rep.launch_confidence or "").strip()
+    if not cov_src or cov_src == "—":
+        cov_src = (view_fr.coverage or group_rep.coverage or "").strip()
+    if not lbl_src:
+        lbl_src = (view_fr.ai_confidence_label or group_rep.ai_confidence_label or "").strip()
+
+    voice = _confidence_voice(lbl_src)
+    bucket = "MEDIUM"
+    if voice == "HIGH":
+        bucket = "HIGH"
+    elif voice == "LOW":
+        bucket = "LOW"
+    elif voice in ("MEDIUM", "MODERATE"):
+        bucket = "MEDIUM"
+
+    # Ratio
+    hit, tot = _parse_ratio_from_text(cov_src)
+    ratio = (float(hit) / float(tot)) if (hit is not None and tot is not None and tot > 0) else None
+
+    # Coverage label
+    if hit is not None and tot is not None:
+        cov_txt = f"{hit}/{tot} futures"
+    else:
+        # Fall back to futures_hit/total (pre-fire), but keep it short.
+        ft = max(1, int(getattr(view_fr, "futures_total", 0) or 0))
+        fh = int(getattr(view_fr, "futures_hit", 0) or 0)
+        if ft > 1:
+            cov_txt = f"{max(0, min(fh, ft))}/{ft} futures"
+            ratio = float(max(0, min(fh, ft))) / float(ft)
+        else:
+            cov_txt = ""
+            ratio = None
+
+    # If there is no verified intercept, make it explicit (unless we already have a numeric futures text).
+    if not cov_txt:
+        pol = (group_rep.action_policy or "").strip().upper()
+        if pol == "NO_PLAN_HOLD":
+            cov_txt = "no verified intercept"
+            ratio = None
+        elif pol == "WEAK_FIRE_HELD":
+            cov_txt = "coverage too low"
+            ratio = None
+
+    return bucket, ratio, cov_txt
+
+
+def _replay_reason_lines(
+    view_fr: PVAReplayFrame,
+    group_rep: PVAReplayFrame,
+    *,
+    phase: str,
+    selected: str,
+    bucket: str,
+    cov_txt: str,
+) -> list[str]:
+    """
+    2–3 short lines explaining why the selected action happened.
+    Replay-only; uses snapshot fields. Keep compact; no long paragraphs.
+    """
+    pol = (group_rep.action_policy or "").strip().upper()
+    la = (group_rep.last_action or "").lower()
+    risky = bool(getattr(group_rep, "risky_unvalidated", False))
+
+    # Terminal/result narration.
+    if _replay_terminal(view_fr) or phase == "RESULT":
+        rt = (view_fr.pva_result_text or "").strip().upper()
+        if view_fr.intercepted or ("INTERCEPTED" in rt):
+            return ["The missile reached the aircraft.", "The firing plan covered the realized future well enough."][:3]
+        if view_fr.escaped or ("ESCAPED" in rt):
+            if getattr(view_fr, "launch_tick", -1) >= 0:
+                return ["The player escaped through the green corridor.", "My fired plan did not cover the final path."][:3]
+            return ["The player escaped through the green corridor.", "No committed shot sealed the corridor."][:3]
+        if view_fr.failed or ("ILLEGAL" in rt):
+            return ["Illegal corridor outcome.", "Geometry failed the engagement."][:3]
+        return ["Outcome resolved."][:3]
+
+    # Missile already committed.
+    if phase == "MISSILE TRACKING" or selected == "OBSERVE":
+        return ["The missile is already launched.", "I am tracking whether the committed shot reaches the aircraft."][:3]
+
+    # FIRE reasoning (caller guarantees an actual launch occurred).
+    if selected == "FIRE":
+        base = "I fire here because the launch was committed."
+        if cov_txt:
+            base2 = f"The shot covers {cov_txt}."
+            return [base, base2][:3]
+        return [base, "This shot aligns with predicted futures."][:3]
+
+    # MOVE reasoning.
+    if selected == "MOVE":
+        if pol == "WEAK_STAGING":
+            lines = [
+                "No clean shot exists yet.",
+                "This is a weak setup move to improve future coverage.",
+            ]
+        else:
+            lines = [
+                "I move the SAM to improve the launch angle.",
+                "This gives the missile a better lane against predicted futures.",
+            ]
+        if risky:
+            lines.append("Uncertainty is high, so I avoid committing a shot.")
+        return lines[:3]
+
+    # WAIT reasoning.
+    if selected == "WAIT":
+        if pol == "WAITING_RADAR":
+            lines = ["I wait to improve sensor lock.", "Uncertainty is too high to fire immediately."]
+        else:
+            lines = ["I can fire now, but waiting gives a cleaner intercept window."]
+            if cov_txt:
+                lines.append(f"Future coverage stays strong ({cov_txt}), so I delay the shot.")
+            else:
+                lines.append("Coverage is not strong enough yet, so I delay the shot.")
+        if bucket == "LOW":
+            lines = ["I am uncertain: predicted futures split too widely.", "I wait because firing now would be a gamble."] + lines[2:]
+        return lines[:3]
+
+    # HOLD reasoning (no plan / weak fire held).
+    if pol == "WEAK_FIRE_HELD":
+        lines = ["The shot is too uncertain to commit.", "Coverage is low, so I refuse to waste the missile."]
+    elif pol == "NO_PLAN_HOLD":
+        lines = ["I cannot verify a real intercept from here.", "I hold position instead of pretending I have a good shot."]
+    else:
+        lines = ["I cannot verify a real intercept from here.", "I hold fire until the plan becomes clearer."]
+    if bucket == "LOW":
+        lines.insert(0, "My confidence is low because predicted futures disagree.")
+    return lines[:3]
+
+
+def _draw_replay_badge(
+    screen: pygame.Surface,
+    rect: pygame.Rect,
+    label: str,
+    font,
+    *,
+    fill,
+    border,
+    text_col,
+) -> None:
+    pygame.draw.rect(screen, fill, rect, border_radius=8)
+    pygame.draw.rect(screen, border, rect, 2, border_radius=8)
+    t = font.render(label, True, text_col)
+    screen.blit(t, t.get_rect(center=rect.center))
+
+
+def _draw_replay_kv_rows(
+    screen: pygame.Surface,
+    clip_rect: pygame.Rect,
+    x: int,
+    y: int,
+    rows: list[tuple[str, str]],
+    font,
+    *,
+    max_px: int,
+    max_rows: int,
+    line_gap: int = 2,
+) -> int:
+    prev_clip = screen.get_clip()
+    lh = font.get_height()
+    yy = y
+    try:
+        screen.set_clip(clip_rect.clip(screen.get_rect()))
+        for i, (k, v) in enumerate(rows[:max_rows]):
+            if yy + lh > clip_rect.bottom:
+                break
+            kk = _replay_trim_line_px(font, f"{k}:", max(40, int(max_px * 0.40)))
+            vv = _replay_trim_line_px(font, v, max(40, int(max_px * 0.56)))
+            s1 = font.render(kk, True, COL_DIM)
+            screen.blit(s1, (x, yy))
+            screen.blit(font.render(vv, True, COL_TEXT), (x + max(70, int(max_px * 0.42)), yy))
+            yy += lh + line_gap
+    finally:
+        screen.set_clip(prev_clip)
+    return yy
+
+
+def _draw_replay_action_cards(
+    screen: pygame.Surface,
+    clip_rect: pygame.Rect,
+    x: int,
+    y: int,
+    w: int,
+    font,
+    selected: str,
+) -> int:
+    labels = ["FIRE", "WAIT", "MOVE", "HOLD", "OBSERVE"]
+    gap = 6
+    card_h = 24
+    # Ensure 5 cards always fit horizontally; shrink width if needed.
+    card_w = max(46, int((w - gap * 4) / 5))
+    total_w = card_w * 5 + gap * 4
+    xx = x + max(0, (w - total_w) // 2)
+    prev_clip = screen.get_clip()
+    try:
+        screen.set_clip(clip_rect.clip(screen.get_rect()))
+        for lab in labels:
+            r = pygame.Rect(xx, y, card_w, card_h)
+            is_sel = (lab == selected)
+            fill = (70, 78, 58) if not is_sel else (245, 168, 64)
+            border = (98, 110, 84) if not is_sel else (255, 220, 140)
+            txt = COL_TEXT if not is_sel else (30, 26, 18)
+            pygame.draw.rect(screen, fill, r, border_radius=6)
+            pygame.draw.rect(screen, border, r, 2, border_radius=6)
+            t = font.render(lab, True, txt)
+            screen.blit(t, t.get_rect(center=r.center))
+            xx += card_w + gap
+    finally:
+        screen.set_clip(prev_clip)
+    return y + card_h + 6
+
+
+def _draw_replay_confidence_bar(
+    screen: pygame.Surface,
+    clip_rect: pygame.Rect,
+    x: int,
+    y: int,
+    w: int,
+    font,
+    bucket: str,
+    ratio: float | None,
+    coverage_text: str,
+) -> int:
+    # Defaults if no ratio available.
+    if ratio is None:
+        ratio = 0.80 if bucket == "HIGH" else (0.55 if bucket == "MEDIUM" else 0.25)
+    ratio = max(0.0, min(1.0, float(ratio)))
+
+    col = (120, 220, 110) if bucket == "HIGH" else ((255, 170, 72) if bucket == "MEDIUM" else (235, 120, 68))
+    prev_clip = screen.get_clip()
+    try:
+        screen.set_clip(clip_rect.clip(screen.get_rect()))
+        hdr = f"{bucket}"
+        if coverage_text:
+            hdr = f"{bucket}  {coverage_text}"
+        hdr = _replay_trim_line_px(font, hdr, w)
+        screen.blit(font.render(hdr, True, COL_TEXT), (x, y))
+        y += font.get_height() + 4
+
+        bar_h = 12
+        bar_r = pygame.Rect(x, y, w, bar_h)
+        pygame.draw.rect(screen, (28, 32, 24), bar_r, border_radius=5)
+        pygame.draw.rect(screen, (86, 92, 70), bar_r, 1, border_radius=5)
+        fill_w = max(0, min(w, int(round(w * ratio))))
+        if fill_w > 0:
+            fill_r = pygame.Rect(x, y, fill_w, bar_h)
+            pygame.draw.rect(screen, col, fill_r, border_radius=5)
+        y += bar_h + 2
+    finally:
+        screen.set_clip(prev_clip)
+    return y
+
+
 def _replay_timeline_lines(frames: list[PVAReplayFrame]) -> list[str]:
     """At most four short milestone lines."""
     n = len(frames)
     if n <= 0:
         return ["—"]
 
-    fired_i = next((i for i, fr in enumerate(frames) if fr.truck_has_fired), None)
+    fired_i = next((i for i in range(len(frames)) if _replay_frame_is_actual_fire(frames, i)), None)
     last = frames[-1]
     rt = (last.pva_result_text or "").strip().upper()
 
@@ -1041,8 +1432,14 @@ def _replay_timeline_lines(frames: list[PVAReplayFrame]) -> list[str]:
 
     if fired_i is None:
         t0, t1 = frames[0].tick, frames[-1].tick
-        tag0 = _replay_preflight_behavior_tag(frames[0])
-        slots.append(fmt_span(t0, t1, _replay_preflight_line(tag0)))
+        # Separate initial radar lock wait if present, then "uncertain / held fire".
+        j = 0
+        while j < n and _replay_preflight_behavior_tag(frames[j]) == "sensor_wait":
+            j += 1
+        if j > 0:
+            slots.append(fmt_span(frames[0].tick, frames[j - 1].tick, "radar lock wait"))
+        if j < n:
+            slots.append(fmt_span(frames[j].tick, frames[-1].tick, "uncertain / held fire"))
         if last.intercepted or ("INTERCEPTED" in rt):
             slots.append(f"T{last.tick}: intercept.")
         elif last.escaped or ("ESCAPED" in rt):
@@ -1205,33 +1602,23 @@ def _replay_round_summary_lines(frames: list[PVAReplayFrame]) -> list[str]:
         return ["Summary: —"]
     last = frames[-1]
     rt = (last.pva_result_text or "").strip().upper()
-    volleys = _replay_volley_count(frames)
-    conf = _confidence_voice(last.ai_confidence_label)
+    any_launch = _replay_any_missile_launched(frames)
 
     if "INTERCEPTED" in rt or last.intercepted:
-        if conf == "HIGH":
-            return ["Summary: SAM intercepted after staging and firing with strong confidence."]
-        if conf == "LOW":
-            return ["Summary: SAM intercepted despite thin coverage."]
-        return ["Summary: SAM intercepted during an engaged window."]
+        return ["Summary: SAM intercepted after committing a missile."]
 
     if "ESCAPED" in rt or last.escaped:
-        if volleys == 0:
-            return ["Summary: Player escaped; SAM withheld fire."]
-        if volleys == 1:
-            return [
-                "Summary: Player escaped.",
-                "SAM fired once, but the futures bundle missed the eventual path.",
-            ]
-        return ["Summary: Player escaped.", f"SAM fired {volleys} volleys without sealing the corridor."]
+        if not any_launch:
+            return ["Summary: Player escaped; SAM withheld fire because confidence stayed low."]
+        return ["Summary: Player escaped; SAM fired, but the final path was not covered."]
 
     if "ILLEGAL" in rt or "ILLEGAL_EXIT" in rt or (
         getattr(last, "failed", False) and (not getattr(last, "intercepted", False))
     ):
-        return ["Summary: Illegal exit — duel lost on geometry."]
+        return ["Summary: Player exited outside the valid corridor."]
 
-    if volleys == 0:
-        return ["Summary: SAM held fire because no verified plan was available."]
+    if not any_launch:
+        return ["Summary: SAM withheld fire because no verified intercept was available."]
     remn = (last.pva_result_text or "Round unresolved in replay snapshot.").strip()
     return ["Summary: " + remn[:88] + ("…" if len(remn) > 88 else "")]
 
@@ -1313,92 +1700,133 @@ def draw_tac_replay_side_panel(
     group_rep = frames[ga]
     view_fr = frames[frame_index]
 
-    hdr = font_hdr.render("REPLAY", True, COL_TAC_TERM_DIM)
+    # Dashboard header
+    hdr = font_hdr.render("DECISION DASHBOARD", True, COL_TAC_TERM_DIM)
     screen.blit(hdr, (x0, y))
-    y += hdr.get_height() + 2
-    sub = font_norm.render("SAM decisions", True, COL_DIM)
-    screen.blit(sub, (x0, y))
-    y += sub.get_height() + 8
+    y += hdr.get_height() + 6
 
-    text_px_inner = max(40, rw - 4)
+    text_px_inner = max(40, rw)
+    clip_panel = pygame.Rect(rect.left + 2, rect.top + 2, rect.width - 4, rect.height - 4)
 
-    status_blk = list(_replay_status_lines(view_fr))
-    if gb > ga:
-        status_blk.append(f"Group ticks   {frames[ga].tick}-{frames[gb].tick}")
-    status_blk = status_blk[:5]
-
-    y = _draw_tac_section_title(screen, x0, y, "STATUS", font_hdr)
-    clip_rest = pygame.Rect(rect.left + 2, y, rect.width - 4, max(0, max_y - y))
-    y = _draw_replay_lines_clipped(
+    # SECTION 1 — PHASE
+    y = _draw_tac_section_title(screen, x0, y, "PHASE", font_hdr)
+    is_fire_tick = _replay_frame_is_actual_fire(frames, frame_index)
+    is_tracking = _replay_frame_is_tracking(frames, frame_index)
+    if _replay_terminal(view_fr):
+        phase = "RESULT"
+    elif is_fire_tick:
+        phase = "FIRE DECISION"
+    elif is_tracking:
+        phase = "MISSILE TRACKING"
+    elif (view_fr.action_policy or "").strip().upper() == "WAITING_RADAR":
+        phase = "SENSOR LOCK"
+    else:
+        phase = "PLANNING"
+    badge_w = min(rw, 210)
+    badge_h = 26
+    badge_r = pygame.Rect(x0, y, badge_w, badge_h)
+    _draw_replay_badge(
         screen,
-        clip_rest,
-        x0 + 2,
-        y,
-        status_blk,
+        badge_r,
+        f"[ {phase} ]",
         font_norm,
-        COL_TEXT,
-        max_lines=5,
-        max_px=text_px_inner,
+        fill=(38, 46, 34),
+        border=COL_PANEL_SEP,
+        text_col=COL_TEXT,
     )
-    y += 8
+    y += badge_h + 10
 
-    thought_four = [
-        f"Observe: {_replay_observe_line(view_fr)}",
-        f"Predict: {_replay_predict_line(view_fr)}",
-        f"Compare: {_replay_compare_line()}",
-        f"Decide: {_replay_decide_thought_line(view_fr, group_rep)}",
+    if y >= max_y:
+        return
+
+    # SECTION 2 — CURRENT STATE
+    y = _draw_tac_section_title(screen, x0, y, "CURRENT STATE", font_hdr)
+    head = _replay_aircraft_heading_word(view_fr)
+    turn_txt = "used" if getattr(view_fr, "pva_turn_used", True) else "available"
+    if _replay_terminal(view_fr):
+        missile_txt = "hit" if view_fr.intercepted else ("missed" if view_fr.escaped else "result")
+    elif is_tracking or (_replay_active_missile_count(view_fr) > 0):
+        missile_txt = "in flight"
+    else:
+        missile_txt = "not launched"
+    fut_total = int(getattr(view_fr, "futures_total", 0) or 0)
+    fut_total = max(0, fut_total)
+    cov = (view_fr.coverage or "").strip()
+    if not cov or cov == "—":
+        ft = max(1, int(getattr(view_fr, "futures_total", 0) or 0))
+        fh = int(getattr(view_fr, "futures_hit", 0) or 0)
+        cov = f"{max(0, min(fh, ft))}/{ft}" if ft > 0 else "—"
+    rows = [
+        ("Aircraft", head),
+        ("Turn", turn_txt),
+        ("Missile", missile_txt),
+        ("Futures", str(fut_total) if fut_total else "—"),
+        ("Coverage", cov),
     ]
-
-    if y >= max_y:
-        return
-    y = _draw_tac_section_title(screen, x0, y, "SAM THOUGHT PROCESS", font_hdr)
     clip_rest = pygame.Rect(rect.left + 2, y, rect.width - 4, max(0, max_y - y))
-    y = _draw_replay_lines_clipped(
+    y = _draw_replay_kv_rows(
         screen,
         clip_rest,
-        x0 + 2,
+        x0,
         y,
-        thought_four,
+        rows,
         font_norm,
-        COL_TEXT,
-        max_lines=4,
         max_px=text_px_inner,
+        max_rows=5,
     )
-    y += 8
+    y += 10
 
-    tl = _replay_timeline_lines(frames)
-    tl = tl[:4]
     if y >= max_y:
         return
-    y = _draw_tac_section_title(screen, x0, y, "BATTLE TIMELINE", font_hdr)
+
+    # SECTION 3 — ACTIONS / SELECTED DECISION
+    y = _draw_tac_section_title(screen, x0, y, "ACTIONS / SELECTED DECISION", font_hdr)
+    if is_fire_tick:
+        selected = "FIRE"
+    elif is_tracking or _replay_terminal(view_fr):
+        selected = "OBSERVE"
+    else:
+        selected = _replay_selected_action(view_fr, group_rep)
     clip_rest = pygame.Rect(rect.left + 2, y, rect.width - 4, max(0, max_y - y))
-    y = _draw_replay_lines_clipped(
-        screen,
-        clip_rest,
-        x0 + 2,
-        y,
-        tl,
-        font_norm,
-        COL_DIM,
-        max_lines=4,
-        max_px=text_px_inner,
-    )
-    y += 8
+    y = _draw_replay_action_cards(screen, clip_rest, x0, y, rw, font_norm, selected)
+    sel_line = _replay_trim_line_px(font_norm, f"Selected: {selected}", text_px_inner)
+    screen.blit(font_norm.render(sel_line, True, COL_TEXT), (x0, y))
+    y += font_norm.get_height() + 10
 
-    note_lines = [ln.strip() for ln in _replay_commander_note_lines(frames, view_fr, ga, gb) if ln.strip()][:2]
     if y >= max_y:
         return
-    y = _draw_tac_section_title(screen, x0, y, "COMMANDER NOTE", font_hdr)
+
+    # SECTION 4 — CONFIDENCE BAR
+    y = _draw_tac_section_title(screen, x0, y, "CONFIDENCE", font_hdr)
+    bucket, ratio, cov_txt = _replay_confidence_pack(view_fr, group_rep)
+    clip_rest = pygame.Rect(rect.left + 2, y, rect.width - 4, max(0, max_y - y))
+    y = _draw_replay_confidence_bar(screen, clip_rest, x0, y, rw, font_norm, bucket, ratio, cov_txt)
+    y += 10
+
+    if y >= max_y:
+        return
+
+    # SECTION 5 — REASON
+    y = _draw_tac_section_title(screen, x0, y, "REASON", font_hdr)
+    reason_lines = _replay_reason_lines(
+        view_fr,
+        group_rep,
+        phase=phase,
+        selected=selected,
+        bucket=bucket,
+        cov_txt=cov_txt,
+    )
+    reason_lines = [_replay_trim_line_px(font_norm, ln, text_px_inner) for ln in reason_lines if ln.strip()][:3]
     clip_rest = pygame.Rect(rect.left + 2, y, rect.width - 4, max(0, max_y - y))
     _draw_replay_lines_clipped(
         screen,
         clip_rest,
-        x0 + 2,
+        x0,
         y,
-        note_lines,
-        font_cmd,
-        COL_TAC_TERM,
-        max_lines=2,
+        reason_lines,
+        font_norm,
+        COL_TEXT,
+        max_lines=3,
         max_px=text_px_inner,
     )
 
@@ -2125,6 +2553,20 @@ def _run_app() -> None:
                             line = line.rstrip() + "…"
                         screen.blit(font_small.render(line, True, COL_TAC_LABEL), (10, sum_y))
                         sum_y += sh
+
+                    # Battle Timeline moved to bottom console (max 3–4 events).
+                    tl = _replay_timeline_lines(frames_d)[:4]
+                    tl_hdr_y = info_y + 34
+                    tl_max_y = ctrl_y - 10 - max(1, len(sum_lines)) * sh - 4
+                    if tl_hdr_y + font_small.get_height() + 2 < tl_max_y:
+                        screen.blit(font_small.render("TIMELINE", True, COL_TAC_LABEL), (10, tl_hdr_y))
+                        yy = tl_hdr_y + font_small.get_height() + 2
+                        for raw in tl:
+                            if yy + font_small.get_height() > tl_max_y:
+                                break
+                            s_ln = _replay_trim_line_px(font_small, raw, cw_px)
+                            screen.blit(font_small.render(s_ln, True, COL_DIM), (10, yy))
+                            yy += sh
                     for btn in (replay_prev_b, replay_next_b, replay_play_b, replay_new_b, replay_menu_b):
                         active = replay_auto and btn is replay_play_b
                         btn.draw(screen, font_small, active=active)
